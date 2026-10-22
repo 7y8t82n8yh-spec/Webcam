@@ -23,7 +23,9 @@ fn install_dir() -> PathBuf {
 }
 
 fn regsvr32(args: &[&str], dll: &Path) -> Result<()> {
-    let status = Command::new("regsvr32").arg("/s").args(args).arg(dll).status().context("running regsvr32")?;
+    let mut command = Command::new("regsvr32");
+    command.arg("/s").args(args).arg(dll);
+    let status = command.status().context("running regsvr32")?;
     if !status.success() {
         bail!("regsvr32 {args:?} {} failed ({status})", dll.display());
     }
@@ -31,8 +33,9 @@ fn regsvr32(args: &[&str], dll: &Path) -> Result<()> {
 }
 
 fn netsh(args: &[&str]) -> Result<()> {
-    let output =
-        Command::new("netsh").args(["advfirewall", "firewall"]).args(args).output().context("running netsh")?;
+    let mut command = Command::new("netsh");
+    command.args(["advfirewall", "firewall"]).args(args);
+    let output = command.output().context("running netsh")?;
     if !output.status.success() {
         bail!("netsh {args:?} failed: {}", String::from_utf8_lossy(&output.stdout).trim());
     }
@@ -65,11 +68,9 @@ fn quote(arg: &str) -> String {
     out
 }
 
-/// Re-run this executable elevated and wait for it. The elevated process starts in
-/// System32 and its console closes when it exits, so paths are made absolute and it
-/// is asked to pause on errors.
-fn relaunch_elevated(dll: Option<&Path>) -> Result<i32> {
-    let exe = std::env::current_exe()?;
+/// This process's arguments, quoted, with `--dll` replaced by the absolute `dll` and
+/// `--pause-on-error` added.
+fn elevated_args(dll: Option<&Path>) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut skip_next = false;
     for arg in std::env::args().skip(1) {
@@ -87,6 +88,15 @@ fn relaunch_elevated(dll: Option<&Path>) -> Result<i32> {
         args.push(quote(&dll.to_string_lossy()));
     }
     args.push("--pause-on-error".into());
+    args
+}
+
+/// Re-run this executable elevated and wait for it. The elevated process starts in
+/// System32 and its console closes when it exits, so paths are made absolute and it
+/// is asked to pause on errors.
+fn relaunch_elevated(dll: Option<&Path>) -> Result<i32> {
+    let exe = std::env::current_exe()?;
+    let args = elevated_args(dll);
     let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(args.join(" ")));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -123,7 +133,8 @@ fn find_dll(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
-    let exe_dir = std::env::current_exe()?.parent().map(Path::to_path_buf).unwrap_or_default();
+    let exe = std::env::current_exe()?;
+    let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     for candidate in [exe_dir.join(DLL_NAME), exe_dir.join("..").join(DLL_NAME)] {
         if candidate.exists() {
             return Ok(candidate);
@@ -156,22 +167,35 @@ pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
         bail!("iPhone Webcam needs Windows 11 (this is build {build})");
     }
     let source = find_dll(dll)?;
+    let target = register_dll(&source)?;
+    println!("Registered the virtual camera ({}).", target.display());
+    // The camera service never unloads the DLL it has; restart it so an upgrade takes
+    // effect now. It starts again by itself when a camera is next used.
+    let stop = Command::new("sc").args(["stop", "FrameServer"]).output();
+    if stop.is_ok_and(|o| o.status.success()) {
+        println!("Restarted the Windows camera service.");
+    }
+    remove_legacy();
+    open_firewall(port)?;
+    println!("\nDone. Start iPhone Webcam; the camera appears in video apps while it runs.");
+    Ok(0)
+}
+
+/// Copy the DLL into the install folder (replacing an earlier one) and register it.
+fn register_dll(source: &Path) -> Result<PathBuf> {
     let dir = install_dir().join("vcam");
     std::fs::create_dir_all(&dir)?;
     let target = dir.join(DLL_NAME);
     if target.exists() {
         let _ = regsvr32(&["/u"], &target);
     }
-    copy_replacing(&source, &target)?;
+    copy_replacing(source, &target)?;
     regsvr32(&[], &target)?;
-    println!("Registered the virtual camera ({}).", target.display());
-    // The camera service never unloads the DLL it has; restart it so an upgrade takes
-    // effect now. It starts again by itself when a camera is next used.
-    if Command::new("sc").args(["stop", "FrameServer"]).output().is_ok_and(|o| o.status.success()) {
-        println!("Restarted the Windows camera service.");
-    }
-    remove_legacy();
+    Ok(target)
+}
 
+/// Allow the TCP port and this program's UDP (WebRTC) traffic in, replacing earlier rules.
+fn open_firewall(port: u16) -> Result<()> {
     let _ = netsh(&["delete", "rule", &format!("name={TCP_RULE}")]);
     netsh(&[
         "add",
@@ -196,8 +220,7 @@ pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
         "profile=any",
     ])?;
     println!("Firewall: allowed TCP {port} and UDP for {}.", exe.display());
-    println!("\nDone. Start iPhone Webcam; the camera appears in video apps while it runs.");
-    Ok(0)
+    Ok(())
 }
 
 pub fn uninstall() -> Result<i32> {
@@ -233,9 +256,8 @@ fn windows_build() -> u32 {
     let output = Command::new("reg")
         .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "/v", "CurrentBuildNumber"])
         .output();
-    output
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.split_whitespace().last().and_then(|n| n.parse().ok()))
-        .unwrap_or(0)
+    let Ok(output) = output else { return 0 };
+    let Ok(text) = String::from_utf8(output.stdout) else { return 0 };
+    let build = text.split_whitespace().last();
+    build.and_then(|n| n.parse().ok()).unwrap_or(0)
 }

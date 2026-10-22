@@ -140,21 +140,9 @@ fn request_wake_lock(page: &Rcp) {
     spawn_local(async move {
         let wake_lock = get(&page.window.navigator(), "wakeLock");
         if !wake_lock.is_undefined() {
-            if let Ok(promise) = call(&wake_lock, "request", &["screen".into()]) {
-                if let Ok(sentinel) = JsFuture::from(Promise::from(promise)).await {
-                    // iOS can drop the lock without hiding the page (e.g. after a system
-                    // alert); take it again.
-                    let again = page.clone();
-                    let on_release = Closure::<dyn FnMut()>::new(move || {
-                        let state = again.state.borrow();
-                        if state.running && !again.hidden() {
-                            let p = again.clone();
-                            set_timeout(&again.window, 1000, move || request_wake_lock(&p));
-                        }
-                    });
-                    let _ = call(&sentinel, "addEventListener", &["release".into(), on_release.into_js_value()]);
-                    return;
-                }
+            if let Ok(sentinel) = take_wake_lock(&wake_lock).await {
+                retake_wake_lock_on_release(&page, &sentinel);
+                return;
             }
             log("wake lock failed, using video fallback");
         }
@@ -169,7 +157,43 @@ fn request_wake_lock(page: &Rcp) {
     });
 }
 
+async fn take_wake_lock(wake_lock: &JsValue) -> Result<JsValue, JsValue> {
+    let promise = call(wake_lock, "request", &["screen".into()])?;
+    JsFuture::from(Promise::from(promise)).await
+}
+
+fn retake_wake_lock_on_release(page: &Rcp, sentinel: &JsValue) {
+    // iOS can drop the lock without hiding the page (e.g. after a system
+    // alert); take it again.
+    let page = page.clone();
+    let on_release = Closure::<dyn FnMut()>::new(move || {
+        let running = page.state.borrow().running;
+        if !running || page.hidden() {
+            return;
+        }
+        let p = page.clone();
+        set_timeout(&page.window, 1000, move || request_wake_lock(&p));
+    });
+    let _ = call(sentinel, "addEventListener", &["release".into(), on_release.into_js_value()]);
+}
+
 // ---------------------------------------------------------------- camera
+
+fn video_track(stream: &MediaStream) -> Result<MediaStreamTrack, JsValue> {
+    stream.get_video_tracks().get(0).dyn_into()
+}
+
+fn camera_constraints(facing: &str, w: u32, h: u32, fps: u32) -> Object {
+    let ideal = |v: JsValue| obj(&[("ideal", v)]);
+    let frame_rate = obj(&[("ideal", fps.into()), ("max", fps.max(30).into())]);
+    let video = obj(&[
+        ("facingMode", ideal(facing.into()).into()),
+        ("width", ideal((w as f64).into()).into()),
+        ("height", ideal((h as f64).into()).into()),
+        ("frameRate", frame_rate.into()),
+    ]);
+    obj(&[("audio", false.into()), ("video", video.into())])
+}
 
 async fn open_camera(page: &Rcp) -> Result<(), JsValue> {
     let (facing, (w, h), fps) = {
@@ -180,29 +204,16 @@ async fn open_camera(page: &Rcp) -> Result<(), JsValue> {
         let size = state.requested.unwrap_or((state.config.width, state.config.height));
         (state.facing, size, state.config.fps)
     };
-    let ideal = |v: f64| obj(&[("ideal", v.into())]).into();
-    let constraints = obj(&[
-        ("audio", false.into()),
-        (
-            "video",
-            obj(&[
-                ("facingMode", obj(&[("ideal", facing.into())]).into()),
-                ("width", ideal(w as f64)),
-                ("height", ideal(h as f64)),
-                ("frameRate", obj(&[("ideal", fps.into()), ("max", fps.max(30).into())]).into()),
-            ])
-            .into(),
-        ),
-    ]);
+    let constraints = camera_constraints(facing, w, h, fps);
     let devices = page.window.navigator().media_devices()?;
-    let stream: MediaStream =
-        JsFuture::from(devices.get_user_media_with_constraints(constraints.unchecked_ref())?).await?.dyn_into()?;
+    let request = devices.get_user_media_with_constraints(constraints.unchecked_ref())?;
+    let stream: MediaStream = JsFuture::from(request).await?.dyn_into()?;
     page.video.set_src_object(Some(&stream));
     update_mirror(page);
     if let Ok(p) = page.video.play() {
         let _ = JsFuture::from(p).await;
     }
-    let track: MediaStreamTrack = stream.get_video_tracks().get(0).dyn_into()?;
+    let track = video_track(&stream)?;
     let on_ended = {
         let page = page.clone();
         Closure::<dyn FnMut()>::new(move || {
@@ -226,10 +237,24 @@ async fn open_camera(page: &Rcp) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// Reopen the camera in the background, showing any error in the status line.
+fn reopen_camera(page: &Rcp) {
+    let page = page.clone();
+    spawn_local(async move {
+        if let Err(e) = open_camera(&page).await {
+            page.set_status(&format!("Camera error: {}", error_text(&e)), "bad");
+        }
+    });
+}
+
 fn update_mirror(page: &Rcp) {
     let state = page.state.borrow();
     let mirrored = state.facing == "user" && state.mirror;
     let _ = page.video.class_list().toggle_with_force("mirror", mirrored);
+}
+
+fn track_live(track: &MediaStreamTrack) -> bool {
+    track.ready_state() == web_sys::MediaStreamTrackState::Live && !track.muted()
 }
 
 fn recover_camera(page: &Rcp) {
@@ -238,19 +263,11 @@ fn recover_camera(page: &Rcp) {
         if !state.running || page.hidden() {
             return;
         }
-        state
-            .stream
-            .as_ref()
-            .and_then(|s| s.get_video_tracks().get(0).dyn_into::<MediaStreamTrack>().ok())
-            .is_some_and(|t| t.ready_state() == web_sys::MediaStreamTrackState::Live && !t.muted())
+        let track = state.stream.as_ref().and_then(|s| video_track(s).ok());
+        track.as_ref().is_some_and(track_live)
     };
     if !live {
-        let page = page.clone();
-        spawn_local(async move {
-            if let Err(e) = open_camera(&page).await {
-                page.set_status(&format!("Camera error: {}", error_text(&e)), "bad");
-            }
-        });
+        reopen_camera(page);
     }
 }
 
@@ -272,6 +289,12 @@ fn client_info(page: &Page) -> ClientInfo {
     }
 }
 
+fn has_option(options: &web_sys::HtmlOptionsCollection, value: &str) -> bool {
+    let option_value =
+        |i| options.item(i).and_then(|o| o.dyn_into::<web_sys::HtmlOptionElement>().ok()).map(|o| o.value());
+    (0..options.length()).any(|i| option_value(i).as_deref() == Some(value))
+}
+
 fn apply_config(page: &Rcp, config: StreamConfig) {
     let changed = {
         let mut state = page.state.borrow_mut();
@@ -282,16 +305,9 @@ fn apply_config(page: &Rcp, config: StreamConfig) {
     let select: HtmlSelectElement = page.id("quality");
     let value = format!("{}x{}", config.width, config.height);
     let options = select.options();
-    let exists = (0..options.length()).any(|i| {
-        options
-            .item(i)
-            .and_then(|o| o.dyn_into::<web_sys::HtmlOptionElement>().ok())
-            .is_some_and(|o| o.value() == value)
-    });
-    if !exists {
-        if let Ok(option) =
-            web_sys::HtmlOptionElement::new_with_text_and_value(&format!("{}p (PC)", config.height), &value)
-        {
+    if !has_option(&options, &value) {
+        let label = format!("{}p (PC)", config.height);
+        if let Ok(option) = web_sys::HtmlOptionElement::new_with_text_and_value(&label, &value) {
             let _ = options.add_with_html_option_element(&option);
         }
     }
@@ -309,20 +325,27 @@ fn apply_config(page: &Rcp, config: StreamConfig) {
 // ---------------------------------------------------------------- WebRTC
 
 fn prefer_h264(transceiver: &JsValue) {
-    // iPhones encode H.264 in hardware: better quality per bit and less heat than VP8.
-    let result = (|| -> Result<(), JsValue> {
-        let receiver_class = get(&web_sys::window().unwrap().into(), "RTCRtpReceiver");
-        let caps = call(&receiver_class, "getCapabilities", &["video".into()])?;
-        let codecs: Array = get(&caps, "codecs").dyn_into()?;
-        let is_h264 =
-            |c: &JsValue| get(c, "mimeType").as_string().is_some_and(|m| m.eq_ignore_ascii_case("video/h264"));
-        let sorted: Array = codecs.iter().filter(is_h264).chain(codecs.iter().filter(|c| !is_h264(c))).collect();
-        call(transceiver, "setCodecPreferences", &[sorted.into()])?;
-        Ok(())
-    })();
-    if result.is_err() {
+    if set_h264_first(transceiver).is_err() {
         log("could not set codec preferences");
     }
+}
+
+fn set_h264_first(transceiver: &JsValue) -> Result<(), JsValue> {
+    // iPhones encode H.264 in hardware: better quality per bit and less heat than VP8.
+    let window: JsValue = web_sys::window().unwrap().into();
+    let receiver_class = get(&window, "RTCRtpReceiver");
+    let caps = call(&receiver_class, "getCapabilities", &["video".into()])?;
+    let codecs: Array = get(&caps, "codecs").dyn_into()?;
+    let is_h264 = |c: &JsValue| get(c, "mimeType").as_string().is_some_and(|m| m.eq_ignore_ascii_case("video/h264"));
+    let h264 = codecs.iter().filter(is_h264);
+    let others = codecs.iter().filter(|c| !is_h264(c));
+    let sorted: Array = h264.chain(others).collect();
+    call(transceiver, "setCodecPreferences", &[sorted.into()])?;
+    Ok(())
+}
+
+fn is_current_pc(page: &Page, pc: &RtcPeerConnection) -> bool {
+    page.state.borrow().pc.as_ref() == Some(pc)
 }
 
 async fn wait_for_ice_gathering(page: &Rcp, pc: &RtcPeerConnection, timeout_ms: i32) {
@@ -330,10 +353,10 @@ async fn wait_for_ice_gathering(page: &Rcp, pc: &RtcPeerConnection, timeout_ms: 
     if pc.ice_gathering_state() == RtcIceGatheringState::Complete {
         return;
     }
-    let promise = Promise::new(&mut |resolve, _| {
-        let resolve2 = resolve.clone();
+    let mut wait = |resolve: js_sys::Function, _reject: js_sys::Function| {
+        let on_timeout = resolve.clone();
         set_timeout(&page.window, timeout_ms, move || {
-            let _ = resolve2.call0(&JsValue::NULL);
+            let _ = on_timeout.call0(&JsValue::NULL);
         });
         let pc2 = pc.clone();
         let on_change = Closure::<dyn FnMut()>::new(move || {
@@ -343,8 +366,25 @@ async fn wait_for_ice_gathering(page: &Rcp, pc: &RtcPeerConnection, timeout_ms: 
         });
         let _ =
             pc.add_event_listener_with_callback("icegatheringstatechange", on_change.into_js_value().unchecked_ref());
-    });
-    let _ = JsFuture::from(promise).await;
+    };
+    let _ = JsFuture::from(Promise::new(&mut wait)).await;
+}
+
+async fn set_parameters(sender: &JsValue, params: JsValue) -> Result<(), JsValue> {
+    let promise = call(sender, "setParameters", &[params])?;
+    JsFuture::from(Promise::from(promise)).await?;
+    Ok(())
+}
+
+fn set_encoding_limits(params: &JsValue, config: &StreamConfig) {
+    let mut encodings = get(params, "encodings").dyn_into::<Array>().unwrap_or_default();
+    if encodings.length() == 0 {
+        encodings = Array::of1(&Object::new());
+        let _ = Reflect::set(params, &"encodings".into(), &encodings);
+    }
+    let first = encodings.get(0);
+    let _ = Reflect::set(&first, &"maxBitrate".into(), &config.max_bitrate.into());
+    let _ = Reflect::set(&first, &"maxFramerate".into(), &config.fps.into());
 }
 
 async fn apply_sender_limits(page: &Rcp) {
@@ -354,22 +394,9 @@ async fn apply_sender_limits(page: &Rcp) {
     };
     let Some(sender) = sender else { return };
     let sender: JsValue = sender.into();
-    let set = |params: JsValue| async {
-        match call(&sender, "setParameters", &[params]) {
-            Ok(p) => JsFuture::from(Promise::from(p)).await.map(|_| ()),
-            Err(e) => Err(e),
-        }
-    };
     if let Ok(params) = call(&sender, "getParameters", &[]) {
-        let mut encodings = get(&params, "encodings").dyn_into::<Array>().unwrap_or_default();
-        if encodings.length() == 0 {
-            encodings = Array::of1(&Object::new());
-            let _ = Reflect::set(&params, &"encodings".into(), &encodings);
-        }
-        let first = encodings.get(0);
-        let _ = Reflect::set(&first, &"maxBitrate".into(), &config.max_bitrate.into());
-        let _ = Reflect::set(&first, &"maxFramerate".into(), &config.fps.into());
-        if set(params).await.is_err() {
+        set_encoding_limits(&params, &config);
+        if set_parameters(&sender, params).await.is_err() {
             log("could not set bitrate limits");
         }
     }
@@ -378,7 +405,7 @@ async fn apply_sender_limits(page: &Rcp) {
     // picture quality instead of shrinking the picture.
     if let Ok(params) = call(&sender, "getParameters", &[]) {
         let _ = Reflect::set(&params, &"degradationPreference".into(), &"maintain-resolution".into());
-        if set(params).await.is_err() {
+        if set_parameters(&sender, params).await.is_err() {
             log("could not set degradation preference");
         }
     }
@@ -387,20 +414,22 @@ async fn apply_sender_limits(page: &Rcp) {
 fn handle_server_message(page: &Rcp, text: &str) {
     match serde_json::from_str::<ServerMessage>(text) {
         Ok(ServerMessage::Config(config)) => apply_config(page, config),
-        Ok(ServerMessage::Replaced) => {
-            let pc = {
-                let mut state = page.state.borrow_mut();
-                state.replaced = true;
-                state.sender = None;
-                state.pc.take()
-            };
-            if let Some(pc) = pc {
-                pc.close();
-            }
-            page.set_status("Another device took over — tap here to take it back", "bad");
-        }
+        Ok(ServerMessage::Replaced) => handle_replaced(page),
         Err(_) => {}
     }
+}
+
+fn handle_replaced(page: &Rcp) {
+    let pc = {
+        let mut state = page.state.borrow_mut();
+        state.replaced = true;
+        state.sender = None;
+        state.pc.take()
+    };
+    if let Some(pc) = pc {
+        pc.close();
+    }
+    page.set_status("Another device took over — tap here to take it back", "bad");
 }
 
 fn connect_webrtc(page: &Rcp) {
@@ -412,12 +441,11 @@ fn connect_webrtc(page: &Rcp) {
     }
     let page = page.clone();
     spawn_local(async move {
-        if let Err(e) = connect_webrtc_inner(&page).await {
-            log(&format!("WebRTC setup failed: {}", error_text(&e)));
-            let pc = page.state.borrow().pc.clone();
-            if let Some(pc) = pc {
-                rtc_failed(&page, &pc);
-            }
+        let Err(e) = connect_webrtc_inner(&page).await else { return };
+        log(&format!("WebRTC setup failed: {}", error_text(&e)));
+        let pc = page.state.borrow().pc.clone();
+        if let Some(pc) = pc {
+            rtc_failed(&page, &pc);
         }
     });
 }
@@ -428,6 +456,25 @@ async fn connect_webrtc_inner(page: &Rcp) -> Result<(), JsValue> {
         return Ok(());
     }
     page.set_status("Connecting…", "");
+    let pc = create_peer_connection(page)?;
+    open_control_channel(page, &pc);
+
+    // Aborting the signalling request on timeout tells the PC to drop this attempt, so
+    // a late answer can't take over from the fallback connection we switch to.
+    let signalling = AbortController::new()?;
+    let timer = start_connect_timer(page, &pc, &signalling);
+    let on_state = {
+        let (page, pc) = (page.clone(), pc.clone());
+        let disconnect_timer = RefCell::new(None::<i32>);
+        Closure::<dyn FnMut()>::new(move || connection_state_changed(&page, &pc, timer, &disconnect_timer))
+    };
+    pc.set_onconnectionstatechange(Some(on_state.into_js_value().unchecked_ref()));
+
+    negotiate(page, &pc, &signalling, timer).await
+}
+
+/// A send-only peer connection carrying the camera track, stored as the current one.
+fn create_peer_connection(page: &Rcp) -> Result<RtcPeerConnection, JsValue> {
     // No STUN/TURN servers: on a LAN (or Tailscale) the devices reach each other directly.
     let config = RtcConfiguration::new();
     config.set_ice_servers(&Array::new());
@@ -435,7 +482,7 @@ async fn connect_webrtc_inner(page: &Rcp) -> Result<(), JsValue> {
     let (stream, track) = {
         let state = page.state.borrow();
         let stream = state.stream.clone().ok_or("no camera")?;
-        let track: MediaStreamTrack = stream.get_video_tracks().get(0).dyn_into()?;
+        let track = video_track(&stream)?;
         (stream, track)
     };
     let init = RtcRtpTransceiverInit::new();
@@ -443,84 +490,89 @@ async fn connect_webrtc_inner(page: &Rcp) -> Result<(), JsValue> {
     init.set_streams(&Array::of1(&stream));
     let transceiver = pc.add_transceiver_with_media_stream_track_and_init(&track, &init);
     prefer_h264(&transceiver);
-    {
-        let mut state = page.state.borrow_mut();
-        state.pc = Some(pc.clone());
-        state.sender = Some(transceiver.sender());
-    }
+    let mut state = page.state.borrow_mut();
+    state.pc = Some(pc.clone());
+    state.sender = Some(transceiver.sender());
+    Ok(pc)
+}
 
+fn open_control_channel(page: &Rcp, pc: &RtcPeerConnection) {
     let channel: RtcDataChannel = pc.create_data_channel("control");
     let on_message = {
         let (page, pc) = (page.clone(), pc.clone());
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let current = page.state.borrow().pc.clone();
-            if current.as_ref() == Some(&pc) {
-                if let Some(text) = event.data().as_string() {
-                    handle_server_message(&page, &text);
-                }
+            if !is_current_pc(&page, &pc) {
+                return;
+            }
+            if let Some(text) = event.data().as_string() {
+                handle_server_message(&page, &text);
             }
         })
     };
     channel.set_onmessage(Some(on_message.into_js_value().unchecked_ref()));
+}
 
-    // Aborting the signalling request on timeout tells the PC to drop this attempt, so
-    // a late answer can't take over from the fallback connection we switch to.
-    let signalling = AbortController::new()?;
-    let timer = {
-        let (page, pc, signalling) = (page.clone(), pc.clone(), signalling.clone());
-        set_timeout(&page.window.clone(), RTC_CONNECT_TIMEOUT_MS, move || {
-            let current = page.state.borrow().pc.clone();
-            if current.as_ref() == Some(&pc) && pc.connection_state() != RtcPeerConnectionState::Connected {
-                signalling.abort();
-                rtc_failed(&page, &pc);
-            }
-        })
-    };
-    let disconnect_timer = Rc::new(RefCell::new(None::<i32>));
-    let on_state = {
-        let (page, pc) = (page.clone(), pc.clone());
-        Closure::<dyn FnMut()>::new(move || {
-            let current = page.state.borrow().pc.clone();
-            if current.as_ref() != Some(&pc) {
-                return;
-            }
-            if let Some(t) = disconnect_timer.borrow_mut().take() {
-                page.window.clear_timeout_with_handle(t);
-            }
-            match pc.connection_state() {
-                RtcPeerConnectionState::Disconnected => {
-                    let (p, c) = (page.clone(), pc.clone());
-                    let t = set_timeout(&page.window, RTC_DISCONNECT_GRACE_MS, move || {
-                        let current = p.state.borrow().pc.clone();
-                        if current.as_ref() == Some(&c) {
-                            rtc_failed(&p, &c);
-                        }
-                    });
-                    *disconnect_timer.borrow_mut() = Some(t);
-                }
-                RtcPeerConnectionState::Connected => {
-                    page.window.clear_timeout_with_handle(timer);
-                    page.state.borrow_mut().rtc_ever_connected = true;
-                    page.set_status("Streaming (WebRTC)", "ok");
-                    let p = page.clone();
-                    spawn_local(async move { apply_sender_limits(&p).await });
-                }
-                RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed => {
-                    page.window.clear_timeout_with_handle(timer);
-                    rtc_failed(&page, &pc);
-                }
-                _ => {}
-            }
-        })
-    };
-    pc.set_onconnectionstatechange(Some(on_state.into_js_value().unchecked_ref()));
+fn start_connect_timer(page: &Rcp, pc: &RtcPeerConnection, signalling: &AbortController) -> i32 {
+    let (p, pc, signalling) = (page.clone(), pc.clone(), signalling.clone());
+    set_timeout(&page.window, RTC_CONNECT_TIMEOUT_MS, move || {
+        if is_current_pc(&p, &pc) && pc.connection_state() != RtcPeerConnectionState::Connected {
+            signalling.abort();
+            rtc_failed(&p, &pc);
+        }
+    })
+}
 
+fn connection_state_changed(
+    page: &Rcp,
+    pc: &RtcPeerConnection,
+    connect_timer: i32,
+    disconnect_timer: &RefCell<Option<i32>>,
+) {
+    if !is_current_pc(page, pc) {
+        return;
+    }
+    if let Some(t) = disconnect_timer.borrow_mut().take() {
+        page.window.clear_timeout_with_handle(t);
+    }
+    match pc.connection_state() {
+        RtcPeerConnectionState::Disconnected => {
+            let (p, c) = (page.clone(), pc.clone());
+            let t = set_timeout(&page.window, RTC_DISCONNECT_GRACE_MS, move || {
+                if is_current_pc(&p, &c) {
+                    rtc_failed(&p, &c);
+                }
+            });
+            *disconnect_timer.borrow_mut() = Some(t);
+        }
+        RtcPeerConnectionState::Connected => {
+            page.window.clear_timeout_with_handle(connect_timer);
+            page.state.borrow_mut().rtc_ever_connected = true;
+            page.set_status("Streaming (WebRTC)", "ok");
+            let p = page.clone();
+            spawn_local(async move { apply_sender_limits(&p).await });
+        }
+        RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed => {
+            page.window.clear_timeout_with_handle(connect_timer);
+            rtc_failed(page, pc);
+        }
+        _ => {}
+    }
+}
+
+/// Send the offer to the PC and apply its answer.
+async fn negotiate(
+    page: &Rcp,
+    pc: &RtcPeerConnection,
+    signalling: &AbortController,
+    timer: i32,
+) -> Result<(), JsValue> {
     let offer = JsFuture::from(pc.create_offer()).await?;
     JsFuture::from(pc.set_local_description(offer.unchecked_ref())).await?;
-    wait_for_ice_gathering(page, &pc, 3000).await;
+    wait_for_ice_gathering(page, pc, 3000).await;
     let sdp = pc.local_description().map(|d| d.sdp()).ok_or("no local description")?;
     let request = OfferRequest { sdp, id: page.client_id.clone(), info: client_info(page) };
-    let response = post_json(page, "/offer", &serde_json::to_string(&request).unwrap(), Some(&signalling)).await?;
+    let body = serde_json::to_string(&request).unwrap();
+    let response = post_json(page, "/offer", &body, Some(signalling)).await?;
     if response.status() == 403 {
         page.window.clear_timeout_with_handle(timer);
         pc.close();
@@ -531,12 +583,12 @@ async fn connect_webrtc_inner(page: &Rcp) -> Result<(), JsValue> {
         page.set_status("Pairing key rejected — scan the QR code on the PC again", "bad");
         return Ok(());
     }
-    let text = JsFuture::from(response.text()?).await?.as_string().unwrap_or_default();
+    let text = response_text(&response).await?;
     if !response.ok() {
         return Err(format!("offer rejected: {} {text}", response.status()).into());
     }
     let answer: OfferResponse = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    if page.state.borrow().pc.as_ref() != Some(&pc) {
+    if !is_current_pc(page, pc) {
         return Ok(());
     }
     apply_config(page, answer.config);
@@ -600,24 +652,24 @@ fn send_hello(page: &Rcp) {
     }
 }
 
+fn is_current_ws(page: &Page, ws: &WebSocket) -> bool {
+    page.state.borrow().ws.as_ref() == Some(ws)
+}
+
 fn connect_ws(page: &Rcp) {
     if page.state.borrow().replaced {
         return;
     }
     let location = page.window.location();
     let proto = if location.protocol().unwrap_or_default() == "https:" { "wss:" } else { "ws:" };
-    let url = format!(
-        "{proto}//{}/ws?id={}&k={}",
-        location.host().unwrap_or_default(),
-        page.client_id,
-        String::from(js_sys::encode_uri_component(&page.key))
-    );
+    let host = location.host().unwrap_or_default();
+    let key = String::from(js_sys::encode_uri_component(&page.key));
+    let url = format!("{proto}//{host}/ws?id={}&k={key}", page.client_id);
     let Ok(ws) = WebSocket::new(&url) else { return };
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
     page.state.borrow_mut().ws = Some(ws.clone());
     page.set_status("Connecting…", "");
 
-    let is_current = |page: &Rcp, ws: &WebSocket| page.state.borrow().ws.as_ref() == Some(ws);
     let open_timer = {
         let ws = ws.clone();
         set_timeout(&page.window, 5000, move || {
@@ -630,90 +682,100 @@ fn connect_ws(page: &Rcp) {
     // otherwise a stale socket's close would tear down the live connection's state.
     let on_open = {
         let (page, ws) = (page.clone(), ws.clone());
-        Closure::<dyn FnMut()>::new(move || {
-            page.window.clear_timeout_with_handle(open_timer);
-            if !is_current(&page, &ws) {
-                let _ = ws.close();
-                return;
-            }
-            {
-                let mut state = page.state.borrow_mut();
-                state.ws_open = true;
-                state.ws_ever_opened = true;
-                state.ws_failures = 0;
-                state.in_flight = 0;
-            }
-            page.set_status("Streaming", "ok");
-            send_hello(&page);
-        })
+        Closure::<dyn FnMut()>::new(move || ws_opened(&page, &ws, open_timer))
     };
     let on_message = {
         let (page, ws) = (page.clone(), ws.clone());
-        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if !is_current(&page, &ws) {
-                return;
-            }
-            let Some(text) = event.data().as_string() else { return };
-            if text == protocol::ACK || text == protocol::BAD {
-                let mut state = page.state.borrow_mut();
-                state.in_flight = state.in_flight.saturating_sub(1);
-            } else {
-                handle_server_message(&page, &text);
-            }
-        })
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| ws_message(&page, &ws, &event))
     };
     let on_close = {
         let (page, ws) = (page.clone(), ws.clone());
-        Closure::<dyn FnMut()>::new(move || {
-            page.window.clear_timeout_with_handle(open_timer);
-            if !is_current(&page, &ws) {
-                return;
-            }
-            let (replaced, give_up) = {
-                let mut state = page.state.borrow_mut();
-                let was_open = state.ws_open;
-                state.ws_open = false;
-                state.in_flight = 0;
-                if !was_open {
-                    state.ws_failures += 1;
-                }
-                // Some iOS versions refuse wss:// to a self-signed certificate even after
-                // the user accepted it for the page. Plain HTTPS POSTs do work.
-                (state.replaced, !state.ws_ever_opened && state.ws_failures >= 2)
-            };
-            if replaced {
-                return;
-            }
-            if give_up {
-                start_http(&page);
-                return;
-            }
-            page.set_status("Reconnecting…", "bad");
-            let p = page.clone();
-            set_timeout(&page.window, 1000, move || connect_ws(&p));
-        })
+        Closure::<dyn FnMut()>::new(move || ws_closed(&page, &ws, open_timer))
     };
     ws.set_onopen(Some(on_open.into_js_value().unchecked_ref()));
     ws.set_onmessage(Some(on_message.into_js_value().unchecked_ref()));
     ws.set_onclose(Some(on_close.into_js_value().unchecked_ref()));
 }
 
+fn ws_opened(page: &Rcp, ws: &WebSocket, open_timer: i32) {
+    page.window.clear_timeout_with_handle(open_timer);
+    if !is_current_ws(page, ws) {
+        let _ = ws.close();
+        return;
+    }
+    {
+        let mut state = page.state.borrow_mut();
+        state.ws_open = true;
+        state.ws_ever_opened = true;
+        state.ws_failures = 0;
+        state.in_flight = 0;
+    }
+    page.set_status("Streaming", "ok");
+    send_hello(page);
+}
+
+fn ws_message(page: &Rcp, ws: &WebSocket, event: &MessageEvent) {
+    if !is_current_ws(page, ws) {
+        return;
+    }
+    let Some(text) = event.data().as_string() else { return };
+    if text == protocol::ACK || text == protocol::BAD {
+        let mut state = page.state.borrow_mut();
+        state.in_flight = state.in_flight.saturating_sub(1);
+    } else {
+        handle_server_message(page, &text);
+    }
+}
+
+fn ws_closed(page: &Rcp, ws: &WebSocket, open_timer: i32) {
+    page.window.clear_timeout_with_handle(open_timer);
+    if !is_current_ws(page, ws) {
+        return;
+    }
+    let (replaced, give_up) = {
+        let mut state = page.state.borrow_mut();
+        let was_open = state.ws_open;
+        state.ws_open = false;
+        state.in_flight = 0;
+        if !was_open {
+            state.ws_failures += 1;
+        }
+        // Some iOS versions refuse wss:// to a self-signed certificate even after
+        // the user accepted it for the page. Plain HTTPS POSTs do work.
+        (state.replaced, !state.ws_ever_opened && state.ws_failures >= 2)
+    };
+    if replaced {
+        return;
+    }
+    if give_up {
+        start_http(page);
+        return;
+    }
+    page.set_status("Reconnecting…", "bad");
+    let p = page.clone();
+    set_timeout(&page.window, 1000, move || connect_ws(&p));
+}
+
 fn start_http(page: &Rcp) {
     page.state.borrow_mut().transport = Transport::Http;
     let page = page.clone();
     spawn_local(async move {
-        if let Ok(response) = JsFuture::from(page.window.fetch_with_str("/config")).await {
-            let response: Response = response.unchecked_into();
-            if let Ok(text) = response.text() {
-                if let Ok(text) = JsFuture::from(text).await {
-                    if let Ok(config) = serde_json::from_str(&text.as_string().unwrap_or_default()) {
-                        apply_config(&page, config);
-                    }
-                }
-            }
+        if let Ok(config) = fetch_config(&page).await {
+            apply_config(&page, config);
         }
         page.set_status("Streaming (HTTP)", "ok");
     });
+}
+
+async fn fetch_config(page: &Rcp) -> Result<StreamConfig, JsValue> {
+    let response: Response = JsFuture::from(page.window.fetch_with_str("/config")).await?.unchecked_into();
+    let text = response_text(&response).await?;
+    serde_json::from_str(&text).map_err(|e| e.to_string().into())
+}
+
+async fn response_text(response: &Response) -> Result<String, JsValue> {
+    let text = JsFuture::from(response.text()?).await?;
+    Ok(text.as_string().unwrap_or_default())
 }
 
 async fn post_json(page: &Rcp, url: &str, body: &str, abort: Option<&AbortController>) -> Result<Response, JsValue> {
@@ -727,7 +789,8 @@ async fn post_json(page: &Rcp, url: &str, body: &str, abort: Option<&AbortContro
     if let Some(abort) = abort {
         init.set_signal(Some(&abort.signal()));
     }
-    Ok(JsFuture::from(page.window.fetch_with_str_and_init(url, &init)).await?.unchecked_into())
+    let request = page.window.fetch_with_str_and_init(url, &init);
+    Ok(JsFuture::from(request).await?.unchecked_into())
 }
 
 fn transport_ready(state: &State) -> bool {
@@ -754,26 +817,7 @@ fn send_frame(page: &Rcp, blob: Blob) {
     }
     let page = page.clone();
     spawn_local(async move {
-        let result = async {
-            let headers = web_sys::Headers::new()?;
-            headers.set("Content-Type", "image/jpeg")?;
-            headers.set(protocol::CLIENT_ID_HEADER, &page.client_id)?;
-            headers.set(protocol::KEY_HEADER, &page.key)?;
-            let abort = AbortController::new()?;
-            let a = abort.clone();
-            // Never let a hung request block sending.
-            let timer = set_timeout(&page.window, 5000, move || a.abort());
-            let init = RequestInit::new();
-            init.set_method("POST");
-            init.set_headers(&headers);
-            init.set_body(&blob);
-            init.set_signal(Some(&abort.signal()));
-            let response = JsFuture::from(page.window.fetch_with_str_and_init("/frame", &init)).await;
-            page.window.clear_timeout_with_handle(timer);
-            Ok::<_, JsValue>(response?.unchecked_into::<Response>().status())
-        }
-        .await;
-        match result {
+        match post_frame(&page, &blob).await {
             Ok(403) => page.set_status("Pairing key rejected — scan the QR code on the PC again", "bad"),
             Ok(_) => page.set_status("Streaming (HTTP)", "ok"),
             Err(_) => page.set_status("PC unreachable", "bad"),
@@ -781,6 +825,27 @@ fn send_frame(page: &Rcp, blob: Blob) {
         let mut state = page.state.borrow_mut();
         state.in_flight = state.in_flight.saturating_sub(1);
     });
+}
+
+/// POST one JPEG frame; returns the HTTP status.
+async fn post_frame(page: &Rcp, blob: &Blob) -> Result<u16, JsValue> {
+    let headers = web_sys::Headers::new()?;
+    headers.set("Content-Type", "image/jpeg")?;
+    headers.set(protocol::CLIENT_ID_HEADER, &page.client_id)?;
+    headers.set(protocol::KEY_HEADER, &page.key)?;
+    let abort = AbortController::new()?;
+    let a = abort.clone();
+    // Never let a hung request block sending.
+    let timer = set_timeout(&page.window, 5000, move || a.abort());
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_headers(&headers);
+    init.set_body(blob);
+    init.set_signal(Some(&abort.signal()));
+    let request = page.window.fetch_with_str_and_init("/frame", &init);
+    let response = JsFuture::from(request).await;
+    page.window.clear_timeout_with_handle(timer);
+    Ok(response?.unchecked_into::<Response>().status())
 }
 
 fn capture_loop(page: &Rcp) {
@@ -798,28 +863,7 @@ fn capture_loop(page: &Rcp) {
         // Never send more pixels than the PC output can use.
         let scale = (max_w as f64 / vw as f64).min(max_h as f64 / vh as f64).min(1.0);
         let (cw, ch) = ((vw as f64 * scale).round() as u32, (vh as f64 * scale).round() as u32);
-        if page.canvas.width() != cw || page.canvas.height() != ch {
-            page.canvas.set_width(cw);
-            page.canvas.set_height(ch);
-        }
-        if let Ok(Some(ctx)) = page.canvas.get_context("2d") {
-            let ctx: CanvasRenderingContext2d = ctx.unchecked_into();
-            let _ = ctx.draw_image_with_html_video_element_and_dw_and_dh(&page.video, 0.0, 0.0, cw as f64, ch as f64);
-            page.state.borrow_mut().encoding = true;
-            let p = page.clone();
-            let callback = Closure::once_into_js(move |blob: JsValue| {
-                p.state.borrow_mut().encoding = false;
-                let ready = transport_ready(&p.state.borrow());
-                if let (Ok(blob), true) = (blob.dyn_into::<Blob>(), ready) {
-                    send_frame(&p, blob);
-                }
-            });
-            let _ = page.canvas.to_blob_with_type_and_encoder_options(
-                callback.unchecked_ref(),
-                "image/jpeg",
-                &quality.into(),
-            );
-        }
+        encode_frame(page, cw, ch, quality);
     }
     let interval = 1000.0 / fps.max(1) as f64;
     let elapsed = now() - started;
@@ -827,7 +871,33 @@ fn capture_loop(page: &Rcp) {
     set_timeout(&page.window, (interval - elapsed).max(0.0) as i32, move || capture_loop(&p));
 }
 
+/// Draw the current video frame at `cw`×`ch` and start encoding it as a JPEG.
+fn encode_frame(page: &Rcp, cw: u32, ch: u32, quality: f64) {
+    if page.canvas.width() != cw || page.canvas.height() != ch {
+        page.canvas.set_width(cw);
+        page.canvas.set_height(ch);
+    }
+    let Ok(Some(ctx)) = page.canvas.get_context("2d") else { return };
+    let ctx: CanvasRenderingContext2d = ctx.unchecked_into();
+    let _ = ctx.draw_image_with_html_video_element_and_dw_and_dh(&page.video, 0.0, 0.0, cw as f64, ch as f64);
+    page.state.borrow_mut().encoding = true;
+    let p = page.clone();
+    let callback = Closure::once_into_js(move |blob: JsValue| frame_encoded(&p, blob));
+    let _ = page.canvas.to_blob_with_type_and_encoder_options(callback.unchecked_ref(), "image/jpeg", &quality.into());
+}
+
+fn frame_encoded(page: &Rcp, blob: JsValue) {
+    page.state.borrow_mut().encoding = false;
+    let ready = transport_ready(&page.state.borrow());
+    if let (Ok(blob), true) = (blob.dyn_into::<Blob>(), ready) {
+        send_frame(page, blob);
+    }
+}
+
 // ---------------------------------------------------------------- stats
+
+/// Time, frame count and byte count at the previous stats tick.
+type StatsSample = (f64, f64, f64);
 
 fn start_stats(page: &Rcp) {
     let last = Rc::new(RefCell::new((now(), 0.0f64, 0.0f64)));
@@ -835,50 +905,59 @@ fn start_stats(page: &Rcp) {
     let tick = Closure::<dyn FnMut()>::new(move || {
         let (page, last) = (page_for_tick.clone(), last.clone());
         spawn_local(async move {
-            // In WebRTC mode the browser does the sending; read its counters instead.
-            let pc = {
-                let state = page.state.borrow();
-                (state.transport == Transport::WebRtc).then(|| state.pc.clone()).flatten()
-            };
-            if let Some(pc) = pc {
-                if let Ok(report) = JsFuture::from(pc.get_stats()).await {
-                    let map: js_sys::Map = report.unchecked_into();
-                    map.for_each(&mut |value, _| {
-                        if get(&value, "type").as_string().as_deref() == Some("outbound-rtp")
-                            && get(&value, "kind").as_string().as_deref() == Some("video")
-                        {
-                            let mut state = page.state.borrow_mut();
-                            if let Some(f) =
-                                get(&value, "framesSent").as_f64().or(get(&value, "framesEncoded").as_f64())
-                            {
-                                state.sent_frames = f;
-                            }
-                            if let Some(b) = get(&value, "bytesSent").as_f64() {
-                                state.sent_bytes = b;
-                            }
-                        }
-                    });
-                }
-            }
-            let (frames, bytes) = {
-                let state = page.state.borrow();
-                (state.sent_frames, state.sent_bytes)
-            };
-            let t = now();
-            let (t0, f0, b0) = *last.borrow();
-            *last.borrow_mut() = (t, frames, bytes);
-            let dt = ((t - t0) / 1000.0).max(0.001);
-            // Counters restart with each new peer connection: never show negative rates.
-            let fps = (frames - f0).max(0.0) / dt;
-            let kbps = (bytes - b0).max(0.0) * 8.0 / 1000.0 / dt;
-            let (vw, vh) = (page.video.video_width(), page.video.video_height());
-            let res = if vw > 0 { format!("{vw}×{vh} · ") } else { String::new() };
-            let rate = if kbps >= 1000.0 { format!("{:.1} Mbps", kbps / 1000.0) } else { format!("{kbps:.0} kbps") };
-            page.id::<HtmlElement>("stats").set_text_content(Some(&format!("{res}{fps:.0} fps · {rate}")));
+            read_rtc_counters(&page).await;
+            show_stats(&page, &last);
         });
     });
-    let _ =
-        page.window.set_interval_with_callback_and_timeout_and_arguments_0(tick.into_js_value().unchecked_ref(), 1000);
+    let tick = tick.into_js_value();
+    let _ = page.window.set_interval_with_callback_and_timeout_and_arguments_0(tick.unchecked_ref(), 1000);
+}
+
+async fn read_rtc_counters(page: &Rcp) {
+    // In WebRTC mode the browser does the sending; read its counters instead.
+    let pc = {
+        let state = page.state.borrow();
+        (state.transport == Transport::WebRtc).then(|| state.pc.clone()).flatten()
+    };
+    let Some(pc) = pc else { return };
+    let Ok(report) = JsFuture::from(pc.get_stats()).await else { return };
+    let map: js_sys::Map = report.unchecked_into();
+    map.for_each(&mut |value, _| record_outbound_video(page, &value));
+}
+
+fn record_outbound_video(page: &Rcp, value: &JsValue) {
+    let is = |key: &str, expected: &str| get(value, key).as_string().as_deref() == Some(expected);
+    if !(is("type", "outbound-rtp") && is("kind", "video")) {
+        return;
+    }
+    let frames_sent = get(value, "framesSent").as_f64();
+    let frames_encoded = get(value, "framesEncoded").as_f64();
+    let mut state = page.state.borrow_mut();
+    if let Some(f) = frames_sent.or(frames_encoded) {
+        state.sent_frames = f;
+    }
+    if let Some(b) = get(value, "bytesSent").as_f64() {
+        state.sent_bytes = b;
+    }
+}
+
+fn show_stats(page: &Rcp, last: &RefCell<StatsSample>) {
+    let (frames, bytes) = {
+        let state = page.state.borrow();
+        (state.sent_frames, state.sent_bytes)
+    };
+    let t = now();
+    let (t0, f0, b0) = *last.borrow();
+    *last.borrow_mut() = (t, frames, bytes);
+    let dt = ((t - t0) / 1000.0).max(0.001);
+    // Counters restart with each new peer connection: never show negative rates.
+    let fps = (frames - f0).max(0.0) / dt;
+    let kbps = (bytes - b0).max(0.0) * 8.0 / 1000.0 / dt;
+    let (vw, vh) = (page.video.video_width(), page.video.video_height());
+    let res = if vw > 0 { format!("{vw}×{vh} · ") } else { String::new() };
+    let rate = if kbps >= 1000.0 { format!("{:.1} Mbps", kbps / 1000.0) } else { format!("{kbps:.0} kbps") };
+    let text = format!("{res}{fps:.0} fps · {rate}");
+    page.id::<HtmlElement>("stats").set_text_content(Some(&text));
 }
 
 // ---------------------------------------------------------------- startup
@@ -911,12 +990,13 @@ async fn start_inner(page: &Rcp) {
     request_wake_lock(page); // must start inside the tap handler on iOS
     if let Err(e) = open_camera(page).await {
         let name = get(&e, "name").as_string().unwrap_or_default();
-        page.show_error(&if name == "NotAllowedError" {
+        let message = if name == "NotAllowedError" {
             "Camera permission was denied. Allow camera access for this site in Settings › Safari › Camera, then reload."
                 .to_string()
         } else {
             format!("Could not open the camera: {}", error_text(&e))
-        });
+        };
+        page.show_error(&message);
         return;
     }
     for (id, hide) in [("start-screen", true), ("top", false), ("bottom", false)] {
@@ -947,12 +1027,8 @@ fn storage_id(window: &Window) -> String {
 
 /// Pairing key from the QR code link. Remembered so a plain reload keeps working.
 fn pairing_key(window: &Window) -> String {
-    let from_url = window
-        .location()
-        .search()
-        .ok()
-        .and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok())
-        .and_then(|p| p.get("k"));
+    let search = window.location().search().ok();
+    let from_url = search.and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok()).and_then(|p| p.get("k"));
     let storage = window.local_storage().ok().flatten();
     match from_url {
         Some(key) => {
@@ -965,6 +1041,91 @@ fn pairing_key(window: &Window) -> String {
     }
 }
 
+/// A "WIDTHxHEIGHT" value from the quality picker; `None` for any other value.
+fn parse_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+fn initial_state() -> State {
+    State {
+        config: StreamConfig::default(),
+        facing: "environment",
+        requested: None,
+        stream: None,
+        transport: Transport::WebRtc,
+        pc: None,
+        sender: None,
+        rtc_ever_connected: false,
+        ws: None,
+        ws_open: false,
+        ws_ever_opened: false,
+        ws_failures: 0,
+        in_flight: 0,
+        encoding: false,
+        running: false,
+        starting: false,
+        replaced: false,
+        mirror: true,
+        sent_frames: 0.0,
+        sent_bytes: 0.0,
+    }
+}
+
+fn attach_controls(page: &Rcp) {
+    let p = page.clone();
+    on(page, "start", "click", move || spawn_local(start(p.clone())));
+    let p = page.clone();
+    on(page, "top", "click", move || {
+        let replaced = std::mem::replace(&mut p.state.borrow_mut().replaced, false);
+        if replaced {
+            reconnect(&p);
+        }
+    });
+    let p = page.clone();
+    on(page, "flip", "click", move || {
+        {
+            let mut state = p.state.borrow_mut();
+            state.facing = if state.facing == "user" { "environment" } else { "user" };
+        }
+        reopen_camera(&p);
+    });
+    let p = page.clone();
+    on(page, "quality", "change", move || {
+        let value = p.id::<HtmlSelectElement>("quality").value();
+        p.state.borrow_mut().requested = parse_size(&value);
+        reopen_camera(&p);
+    });
+    let p = page.clone();
+    on(page, "mirror", "click", move || {
+        {
+            let mut state = p.state.borrow_mut();
+            state.mirror = !state.mirror;
+        }
+        update_mirror(&p);
+    });
+    let p = page.clone();
+    on(page, "dimbtn", "click", move || {
+        let _ = p.id::<HtmlElement>("dim").class_list().add_1("on");
+    });
+    let p = page.clone();
+    on(page, "dim", "click", move || {
+        let _ = p.id::<HtmlElement>("dim").class_list().remove_1("on");
+    });
+}
+
+fn page_shown(page: &Rcp) {
+    if page.hidden() || !page.state.borrow().running {
+        return;
+    }
+    // The wake lock is released whenever the page is hidden, and iOS may have
+    // stopped the camera meanwhile. iOS un-mutes the track shortly after the page
+    // returns; only reopen it if it is still dead after that.
+    request_wake_lock(page);
+    let p = page.clone();
+    set_timeout(&page.window, 1000, move || recover_camera(&p));
+}
+
 #[wasm_bindgen(start)]
 pub fn main() {
     let window = web_sys::window().expect("window");
@@ -974,95 +1135,14 @@ pub fn main() {
         canvas: document.create_element("canvas").expect("canvas").unchecked_into(),
         client_id: storage_id(&window),
         key: pairing_key(&window),
-        state: RefCell::new(State {
-            config: StreamConfig::default(),
-            facing: "environment",
-            requested: None,
-            stream: None,
-            transport: Transport::WebRtc,
-            pc: None,
-            sender: None,
-            rtc_ever_connected: false,
-            ws: None,
-            ws_open: false,
-            ws_ever_opened: false,
-            ws_failures: 0,
-            in_flight: 0,
-            encoding: false,
-            running: false,
-            starting: false,
-            replaced: false,
-            mirror: true,
-            sent_frames: 0.0,
-            sent_bytes: 0.0,
-        }),
+        state: RefCell::new(initial_state()),
         window,
         document,
     });
 
+    attach_controls(&page);
     let p = page.clone();
-    on(&page, "start", "click", move || spawn_local(start(p.clone())));
-    let p = page.clone();
-    on(&page, "top", "click", move || {
-        let replaced = std::mem::replace(&mut p.state.borrow_mut().replaced, false);
-        if replaced {
-            reconnect(&p);
-        }
-    });
-    let p = page.clone();
-    on(&page, "flip", "click", move || {
-        {
-            let mut state = p.state.borrow_mut();
-            state.facing = if state.facing == "user" { "environment" } else { "user" };
-        }
-        let p = p.clone();
-        spawn_local(async move {
-            if let Err(e) = open_camera(&p).await {
-                p.set_status(&format!("Camera error: {}", error_text(&e)), "bad");
-            }
-        });
-    });
-    let p = page.clone();
-    on(&page, "quality", "change", move || {
-        let value = p.id::<HtmlSelectElement>("quality").value();
-        p.state.borrow_mut().requested =
-            value.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
-        let p = p.clone();
-        spawn_local(async move {
-            if let Err(e) = open_camera(&p).await {
-                p.set_status(&format!("Camera error: {}", error_text(&e)), "bad");
-            }
-        });
-    });
-    let p = page.clone();
-    on(&page, "mirror", "click", move || {
-        {
-            let mut state = p.state.borrow_mut();
-            state.mirror = !state.mirror;
-        }
-        update_mirror(&p);
-    });
-    let p = page.clone();
-    on(&page, "dimbtn", "click", move || {
-        let _ = p.id::<HtmlElement>("dim").class_list().add_1("on");
-    });
-    let p = page.clone();
-    on(&page, "dim", "click", move || {
-        let _ = p.id::<HtmlElement>("dim").class_list().remove_1("on");
-    });
-
-    let p = page.clone();
-    let on_visibility = Closure::<dyn FnMut()>::new(move || {
-        if p.hidden() || !p.state.borrow().running {
-            return;
-        }
-        // The wake lock is released whenever the page is hidden, and iOS may have
-        // stopped the camera meanwhile. iOS un-mutes the track shortly after the page
-        // returns; only reopen it if it is still dead after that.
-        request_wake_lock(&p);
-        let p2 = p.clone();
-        set_timeout(&p.window, 1000, move || recover_camera(&p2));
-    });
+    let on_visibility = Closure::<dyn FnMut()>::new(move || page_shown(&p));
     let _ = page
         .document
         .add_event_listener_with_callback("visibilitychange", on_visibility.into_js_value().unchecked_ref());

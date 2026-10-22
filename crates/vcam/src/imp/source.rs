@@ -80,16 +80,15 @@ pub struct Stream {
 
 impl Stream {
     fn new(descriptor: IMFStreamDescriptor) -> windows::core::Result<Self> {
-        let shared = Arc::new(Shared {
-            inner: Mutex::new(StreamInner {
-                queue: Some(unsafe { MFCreateEventQueue()? }),
-                descriptor: Some(descriptor),
-                state: MF_STREAM_STATE_STOPPED,
-                requests: VecDeque::new(),
-                stopping: false,
-            }),
-            wake: Condvar::new(),
-        });
+        let queue = unsafe { MFCreateEventQueue()? };
+        let inner = StreamInner {
+            queue: Some(queue),
+            descriptor: Some(descriptor),
+            state: MF_STREAM_STATE_STOPPED,
+            requests: VecDeque::new(),
+            stopping: false,
+        };
+        let shared = Arc::new(Shared { inner: Mutex::new(inner), wake: Condvar::new() });
         let worker_shared = shared.clone();
         let worker = std::thread::Builder::new()
             .name("vcam-stream".into())
@@ -114,22 +113,26 @@ impl Stream {
     }
 
     fn shutdown(&self) {
-        {
-            let mut inner = lock(&self.shared.inner);
-            inner.stopping = true;
-            if let Some(queue) = inner.queue.take() {
-                let _ = unsafe { queue.Shutdown() };
-            }
-            inner.requests.clear();
-            inner.descriptor = None;
+        let mut inner = lock(&self.shared.inner);
+        inner.stopping = true;
+        if let Some(queue) = inner.queue.take() {
+            let _ = unsafe { queue.Shutdown() };
         }
+        inner.requests.clear();
+        inner.descriptor = None;
+        drop(inner);
         self.shared.wake.notify_all();
-        if let Some(worker) = lock(&self.worker).take() {
-            if worker.thread().id() != std::thread::current().id() {
-                let _ = worker.join();
-            }
-        }
+        self.join_worker();
         *lock(&self.source) = None;
+    }
+
+    /// Wait for the worker to exit (unless this is the worker), holding the worker lock.
+    fn join_worker(&self) {
+        let mut slot = lock(&self.worker);
+        let Some(worker) = slot.take() else { return };
+        if worker.thread().id() != std::thread::current().id() {
+            let _ = worker.join();
+        }
     }
 
     fn queue(&self) -> windows::core::Result<IMFMediaEventQueue> {
@@ -149,46 +152,63 @@ fn worker(shared: Arc<Shared>) {
     let mut due: i64 = 0;
     let mut logged = 0;
     loop {
-        let (token, descriptor) = {
-            let mut inner = lock(&shared.inner);
-            while !inner.stopping && inner.requests.is_empty() {
-                inner = shared.wake.wait(inner).unwrap_or_else(|e| e.into_inner());
-            }
-            if inner.stopping {
-                return;
-            }
-            let token = inner.requests.pop_front().flatten();
-            (token, inner.descriptor.clone())
-        };
-        let now = unsafe { MFGetSystemTime() };
-        if due > now {
-            std::thread::sleep(Duration::from_nanos(((due - now) * 100) as u64));
-        }
-        due = due.max(now) + FRAME_DURATION;
+        let Some((token, descriptor)) = next_request(&shared) else { return };
+        pace(&mut due);
 
         let sample = descriptor.ok_or_else(shutdown_error).and_then(|d| unsafe { create_sample(&d, &mut reader) });
-        let sample = sample.and_then(|s| {
-            if let Some(token) = &token {
-                unsafe { s.SetUnknown(&MFSampleExtension_Token, token)? };
-            }
-            Ok(s)
-        });
+        let sample = sample.and_then(|s| unsafe { attach_token(s, token.as_ref()) });
         if logged < 3 || sample.is_err() {
             logged += 1;
-            vlog!("stream sample: {:?}", sample.as_ref().map(|_| ()).map_err(|e| e.code()));
+            let outcome = sample.as_ref().map(|_| ()).map_err(|e| e.code());
+            vlog!("stream sample: {:?}", outcome);
         }
-        let inner = lock(&shared.inner);
-        let Some(queue) = inner.queue.clone() else { continue };
-        if inner.state != MF_STREAM_STATE_RUNNING {
-            continue;
-        }
-        drop(inner);
-        unsafe {
-            let _ = match sample {
-                Ok(sample) => queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample),
-                Err(e) => queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), e.code(), std::ptr::null()),
-            };
-        }
+        deliver(&shared, sample);
+    }
+}
+
+/// Wait for a sample request: its token and the current descriptor, or `None` once stopping.
+fn next_request(shared: &Shared) -> Option<(Option<IUnknown>, Option<IMFStreamDescriptor>)> {
+    let mut inner = lock(&shared.inner);
+    while !inner.stopping && inner.requests.is_empty() {
+        inner = shared.wake.wait(inner).unwrap_or_else(|e| e.into_inner());
+    }
+    if inner.stopping {
+        return None;
+    }
+    let token = inner.requests.pop_front().flatten();
+    Some((token, inner.descriptor.clone()))
+}
+
+/// Sleep until the next frame is due and schedule the one after.
+fn pace(due: &mut i64) {
+    let now = unsafe { MFGetSystemTime() };
+    if *due > now {
+        let wait = Duration::from_nanos(((*due - now) * 100) as u64);
+        std::thread::sleep(wait);
+    }
+    *due = (*due).max(now) + FRAME_DURATION;
+}
+
+unsafe fn attach_token(sample: IMFSample, token: Option<&IUnknown>) -> windows::core::Result<IMFSample> {
+    if let Some(token) = token {
+        sample.SetUnknown(&MFSampleExtension_Token, token)?;
+    }
+    Ok(sample)
+}
+
+/// Queue the sample (or the error making it) if the stream is still running.
+fn deliver(shared: &Shared, sample: windows::core::Result<IMFSample>) {
+    let inner = lock(&shared.inner);
+    let Some(queue) = inner.queue.clone() else { return };
+    if inner.state != MF_STREAM_STATE_RUNNING {
+        return;
+    }
+    drop(inner);
+    unsafe {
+        let _ = match sample {
+            Ok(sample) => queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample),
+            Err(e) => queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), e.code(), std::ptr::null()),
+        };
     }
 }
 
@@ -292,6 +312,29 @@ impl IMFMediaStream2_Impl for Stream_Impl {
 
 // ---------------------------------------------------------------- source
 
+/// Every offered format: NV12 then RGB32, each in all `SIZES`.
+unsafe fn create_video_types() -> windows::core::Result<Vec<Option<IMFMediaType>>> {
+    let mut types = Vec::new();
+    for subtype in [MFVideoFormat_NV12, MFVideoFormat_RGB32] {
+        for (w, h) in SIZES {
+            types.push(Some(create_video_type(&subtype, w, h)?));
+        }
+    }
+    Ok(types)
+}
+
+unsafe fn create_stream_descriptor() -> windows::core::Result<IMFStreamDescriptor> {
+    let types = create_video_types()?;
+    let descriptor = MFCreateStreamDescriptor(0, &types)?;
+    descriptor.GetMediaTypeHandler()?.SetCurrentMediaType(types[0].as_ref())?;
+    // What the Frame Server needs to treat the stream as a colour camera.
+    descriptor.SetGUID(&MF_DEVICESTREAM_STREAM_CATEGORY, &PINNAME_VIDEO_CAPTURE)?;
+    descriptor.SetUINT32(&MF_DEVICESTREAM_STREAM_ID, 0)?;
+    descriptor.SetUINT32(&MF_DEVICESTREAM_FRAMESERVER_SHARED, 1)?;
+    descriptor.SetUINT32(&MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color.0 as u32)?;
+    Ok(descriptor)
+}
+
 #[implement(IMFMediaSourceEx, IKsControl)]
 pub struct Source {
     inner: Mutex<SourceInner>,
@@ -308,35 +351,19 @@ struct SourceInner {
 impl Source {
     pub fn create() -> windows::core::Result<ComObject<Source>> {
         unsafe {
-            let mut types = Vec::new();
-            for subtype in [MFVideoFormat_NV12, MFVideoFormat_RGB32] {
-                for (w, h) in SIZES {
-                    types.push(Some(create_video_type(&subtype, w, h)?));
-                }
-            }
-            let descriptor = MFCreateStreamDescriptor(0, &types)?;
-            descriptor.GetMediaTypeHandler()?.SetCurrentMediaType(types[0].as_ref())?;
-            // What the Frame Server needs to treat the stream as a colour camera.
-            descriptor.SetGUID(&MF_DEVICESTREAM_STREAM_CATEGORY, &PINNAME_VIDEO_CAPTURE)?;
-            descriptor.SetUINT32(&MF_DEVICESTREAM_STREAM_ID, 0)?;
-            descriptor.SetUINT32(&MF_DEVICESTREAM_FRAMESERVER_SHARED, 1)?;
-            descriptor.SetUINT32(&MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color.0 as u32)?;
+            let descriptor = create_stream_descriptor()?;
             let presentation = MFCreatePresentationDescriptor(Some(&[Some(descriptor.clone())]))?;
             presentation.SelectStream(0)?;
             let mut attributes = None;
             MFCreateAttributes(&mut attributes, 1)?;
 
             let stream = ComObject::new(Stream::new(descriptor)?);
-            let source = ComObject::new(Source {
-                inner: Mutex::new(SourceInner {
-                    queue: Some(MFCreateEventQueue()?),
-                    attributes: attributes.ok_or(E_POINTER)?,
-                    presentation,
-                    started: false,
-                }),
-                stream: stream.clone(),
-            });
-            *lock(&stream.source) = Some(source.to_interface::<IMFMediaSourceEx>().into());
+            let queue = MFCreateEventQueue()?;
+            let attributes = attributes.ok_or(E_POINTER)?;
+            let inner = SourceInner { queue: Some(queue), attributes, presentation, started: false };
+            let source = ComObject::new(Source { inner: Mutex::new(inner), stream: stream.clone() });
+            let source_interface: IMFMediaSource = source.to_interface::<IMFMediaSourceEx>().into();
+            *lock(&stream.source) = Some(source_interface);
             vlog!("source created");
             Ok(source)
         }
@@ -461,7 +488,9 @@ impl IMFMediaSourceEx_Impl for Source_Impl {
             return Err(MF_E_INVALIDSTREAMNUMBER.into());
         }
         // A stream descriptor is an attribute store carrying the stream attributes.
-        lock(&self.stream.shared.inner).descriptor.as_ref().ok_or_else(shutdown_error)?.cast()
+        let inner = lock(&self.stream.shared.inner);
+        let descriptor = inner.descriptor.as_ref().ok_or_else(shutdown_error)?;
+        descriptor.cast()
     }
 
     fn SetD3DManager(&self, _manager: Ref<IUnknown>) -> windows::core::Result<()> {

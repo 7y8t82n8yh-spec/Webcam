@@ -51,18 +51,19 @@ impl MfH264Decoder {
         unsafe {
             for index in 0.. {
                 let Ok(candidate) = self.transform.GetOutputAvailableType(0, index) else { break };
-                if candidate.GetGUID(&MF_MT_SUBTYPE)? == MFVideoFormat_NV12 {
-                    self.transform.SetOutputType(0, &candidate, 0)?;
-                    let size = candidate.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
-                    self.allocated = ((size >> 32) as u32, size as u32);
-                    self.visible = self.allocated;
-                    let mut blob = [0u8; std::mem::size_of::<MFVideoArea>()];
-                    if candidate.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut blob, None).is_ok() {
-                        let area: MFVideoArea = std::ptr::read_unaligned(blob.as_ptr() as *const _);
-                        self.visible = (area.Area.cx as u32, area.Area.cy as u32);
-                    }
-                    return Ok(());
+                if candidate.GetGUID(&MF_MT_SUBTYPE)? != MFVideoFormat_NV12 {
+                    continue;
                 }
+                self.transform.SetOutputType(0, &candidate, 0)?;
+                let size = candidate.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+                self.allocated = ((size >> 32) as u32, size as u32);
+                self.visible = self.allocated;
+                let mut blob = [0u8; std::mem::size_of::<MFVideoArea>()];
+                if candidate.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut blob, None).is_ok() {
+                    let area: MFVideoArea = std::ptr::read_unaligned(blob.as_ptr() as *const _);
+                    self.visible = (area.Area.cx as u32, area.Area.cy as u32);
+                }
+                return Ok(());
             }
         }
         anyhow::bail!("decoder offers no NV12 output")
@@ -71,38 +72,44 @@ impl MfH264Decoder {
     /// Pull every decoded picture out of the transform.
     fn drain(&mut self, out: &mut dyn FnMut(&Yuv420)) -> Result<()> {
         loop {
-            unsafe {
-                let info = self.transform.GetOutputStreamInfo(0)?;
-                let provides = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
-                let sample = if provides {
-                    None
-                } else {
-                    let sample = MFCreateSample()?;
-                    sample.AddBuffer(&MFCreateMemoryBuffer(info.cbSize)?)?;
-                    Some(sample)
-                };
-                let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
-                    dwStreamID: 0,
-                    pSample: ManuallyDrop::new(sample),
-                    dwStatus: 0,
-                    pEvents: ManuallyDrop::new(None),
-                }];
-                let mut status = 0u32;
-                let result = self.transform.ProcessOutput(0, &mut buffers, &mut status);
-                let sample = ManuallyDrop::take(&mut buffers[0].pSample);
-                drop(ManuallyDrop::take(&mut buffers[0].pEvents));
-                match result {
-                    Ok(()) => {
-                        if let Some(sample) = sample {
-                            self.emit(&sample, out)?;
-                        }
-                    }
-                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
-                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => self.choose_nv12_output()?,
-                    Err(e) => return Err(e).context("ProcessOutput"),
+            let sample = unsafe { self.allocate_output_sample()? };
+            let (result, sample) = unsafe { self.process_output(sample) };
+            match result {
+                Ok(()) => {
+                    let Some(sample) = sample else { continue };
+                    unsafe { self.emit(&sample, out)? };
                 }
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => self.choose_nv12_output()?,
+                Err(e) => return Err(e).context("ProcessOutput"),
             }
         }
+    }
+
+    /// A sample for the transform to decode into, unless it provides its own.
+    unsafe fn allocate_output_sample(&self) -> Result<Option<IMFSample>> {
+        let info = self.transform.GetOutputStreamInfo(0)?;
+        if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0 {
+            return Ok(None);
+        }
+        let sample = MFCreateSample()?;
+        sample.AddBuffer(&MFCreateMemoryBuffer(info.cbSize)?)?;
+        Ok(Some(sample))
+    }
+
+    /// One `ProcessOutput` call: its result and the sample holding the picture, if any.
+    unsafe fn process_output(&self, sample: Option<IMFSample>) -> (windows::core::Result<()>, Option<IMFSample>) {
+        let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(sample),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+        let result = self.transform.ProcessOutput(0, &mut buffers, &mut status);
+        let sample = ManuallyDrop::take(&mut buffers[0].pSample);
+        drop(ManuallyDrop::take(&mut buffers[0].pEvents));
+        (result, sample)
     }
 
     unsafe fn emit(&self, sample: &IMFSample, out: &mut dyn FnMut(&Yuv420)) -> Result<()> {

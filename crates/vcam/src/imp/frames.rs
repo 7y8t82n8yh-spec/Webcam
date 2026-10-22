@@ -19,6 +19,13 @@ use super::{vlog, wide};
 /// After this long without a write the app is gone: show black, not a frozen frame.
 const STALE_MS: u64 = 3000;
 
+/// The outcome of one attempt at copying the frame out of the section.
+enum Attempt {
+    Copied,
+    Retry,
+    NeverWritten,
+}
+
 pub struct FrameReader {
     section: Option<(HANDLE, MEMORY_MAPPED_VIEW_ADDRESS)>,
     last_attempt: Option<Instant>,
@@ -45,42 +52,49 @@ impl FrameReader {
     /// frame is returned again rather than black.
     pub fn read(&mut self) -> Option<(&[u8], u32, u32)> {
         let base = self.view()?;
-        unsafe {
-            let header = base as *const Header;
-            // Plain atomic loads only: the view is read-only, and a compare-exchange
-            // would write (and fault).
-            let sequence = &*(std::ptr::addr_of!((*header).sequence) as *const AtomicI64);
-            for _ in 0..4 {
-                let before = sequence.load(Ordering::Acquire);
-                if before == 0 {
-                    return None; // never written
-                }
-                if before & 1 == 1 {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                let (w, h) = ((*header).width, (*header).height);
-                let tick = (*header).write_tick;
-                if w == 0 || h == 0 || w > fs::MAX_WIDTH || h > fs::MAX_HEIGHT {
-                    continue; // torn read
-                }
-                let len = (w * h * 3) as usize;
-                self.scratch.resize(len, 0);
-                std::ptr::copy_nonoverlapping(base.add(fs::HEADER_SIZE), self.scratch.as_mut_ptr(), len);
-                std::sync::atomic::fence(Ordering::Acquire);
-                if sequence.load(Ordering::Acquire) != before {
-                    continue;
-                }
-                std::mem::swap(&mut self.last, &mut self.scratch);
-                self.last_size = (w, h);
-                self.last_tick = tick;
-                break;
-            }
-            if self.last.is_empty() || GetTickCount64().saturating_sub(self.last_tick) > STALE_MS {
-                return None;
+        for _ in 0..4 {
+            match unsafe { self.try_copy(base) } {
+                Attempt::Copied => break,
+                Attempt::Retry => continue,
+                Attempt::NeverWritten => return None,
             }
         }
+        if self.last.is_empty() || unsafe { GetTickCount64() }.saturating_sub(self.last_tick) > STALE_MS {
+            return None;
+        }
         Some((&self.last, self.last_size.0, self.last_size.1))
+    }
+
+    /// Copy the frame at `base` into `last` if it is complete and unchanged while copying.
+    unsafe fn try_copy(&mut self, base: *const u8) -> Attempt {
+        let header = base as *const Header;
+        // Plain atomic loads only: the view is read-only, and a compare-exchange
+        // would write (and fault).
+        let sequence = &*(std::ptr::addr_of!((*header).sequence) as *const AtomicI64);
+        let before = sequence.load(Ordering::Acquire);
+        if before == 0 {
+            return Attempt::NeverWritten;
+        }
+        if before & 1 == 1 {
+            std::thread::sleep(Duration::from_millis(1));
+            return Attempt::Retry;
+        }
+        let (w, h) = ((*header).width, (*header).height);
+        let tick = (*header).write_tick;
+        if w == 0 || h == 0 || w > fs::MAX_WIDTH || h > fs::MAX_HEIGHT {
+            return Attempt::Retry; // torn read
+        }
+        let len = (w * h * 3) as usize;
+        self.scratch.resize(len, 0);
+        std::ptr::copy_nonoverlapping(base.add(fs::HEADER_SIZE), self.scratch.as_mut_ptr(), len);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if sequence.load(Ordering::Acquire) != before {
+            return Attempt::Retry;
+        }
+        std::mem::swap(&mut self.last, &mut self.scratch);
+        self.last_size = (w, h);
+        self.last_tick = tick;
+        Attempt::Copied
     }
 
     fn view(&mut self) -> Option<*const u8> {
@@ -93,40 +107,7 @@ impl FrameReader {
         }
         self.last_attempt = Some(Instant::now());
         unsafe {
-            // System, LocalService, Administrators and interactive users may use it. The
-            // low integrity label lets the (medium integrity) app write to a section
-            // created by a service. We only ever read it.
-            let mut descriptor = PSECURITY_DESCRIPTOR::default();
-            let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;LW)");
-            let _ = ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            );
-            let attributes = SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: descriptor.0,
-                bInheritHandle: false.into(),
-            };
-            let name = wide(fs::SECTION_NAME);
-            let created = CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                Some(&attributes),
-                PAGE_READWRITE,
-                0,
-                fs::SECTION_SIZE as u32,
-                PCWSTR(name.as_ptr()),
-            );
-            if !descriptor.0.is_null() {
-                let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-            }
-            // The app may keep an earlier section alive, or we're not in the service and
-            // can't create Global objects: open what's there, read-only.
-            let handle = match created {
-                Ok(h) => h,
-                Err(_) => OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())).ok()?,
-            };
+            let handle = create_or_open_section()?;
             let view = MapViewOfFile(handle, FILE_MAP_READ, 0, 0, fs::SECTION_SIZE);
             if view.Value.is_null() {
                 let _ = CloseHandle(handle);
@@ -137,6 +118,43 @@ impl FrameReader {
             self.section = Some((handle, view));
             Some(view.Value as *const u8)
         }
+    }
+}
+
+unsafe fn create_or_open_section() -> Option<HANDLE> {
+    // System, LocalService, Administrators and interactive users may use it. The
+    // low integrity label lets the (medium integrity) app write to a section
+    // created by a service. We only ever read it.
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;LW)");
+    let _ = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        PCWSTR(sddl.as_ptr()),
+        SDDL_REVISION_1,
+        &mut descriptor,
+        None,
+    );
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let name = wide(fs::SECTION_NAME);
+    let created = CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        Some(&attributes),
+        PAGE_READWRITE,
+        0,
+        fs::SECTION_SIZE as u32,
+        PCWSTR(name.as_ptr()),
+    );
+    if !descriptor.0.is_null() {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    // The app may keep an earlier section alive, or we're not in the service and
+    // can't create Global objects: open what's there, read-only.
+    match created {
+        Ok(h) => Some(h),
+        Err(_) => OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())).ok(),
     }
 }
 

@@ -39,34 +39,20 @@ fn wide(s: &str) -> Vec<u16> {
 /// the camera service can write to) or else its temp folder.
 pub(crate) fn log(message: std::fmt::Arguments) {
     static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let file = FILE.get_or_init(|| {
-        let mut enabled = 0u32;
-        let mut size = 4u32;
-        let ok = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                PCWSTR(wide(r"SOFTWARE\iPhoneWebcam").as_ptr()),
-                PCWSTR(wide("VCamLog").as_ptr()),
-                RRF_RT_REG_DWORD,
-                None,
-                Some(&mut enabled as *mut u32 as *mut c_void),
-                Some(&mut size),
-            )
-        };
-        if ok != ERROR_SUCCESS || enabled == 0 {
-            return None;
-        }
-        let dir = read_registry_string(r"SOFTWARE\iPhoneWebcam", "VCamLogDir")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let path = dir.join(format!("iPhoneWebcamVCam-{}.log", std::process::id()));
-        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
-    });
-    if let Some(file) = file {
-        if let Ok(mut f) = file.lock() {
-            let _ = writeln!(f, "{:?} [{:?}] {}", std::time::SystemTime::now(), std::thread::current().id(), message);
-        }
+    let Some(file) = FILE.get_or_init(open_log_file) else { return };
+    let Ok(mut f) = file.lock() else { return };
+    let _ = writeln!(f, "{:?} [{:?}] {}", std::time::SystemTime::now(), std::thread::current().id(), message);
+}
+
+fn open_log_file() -> Option<Mutex<std::fs::File>> {
+    if read_registry_dword(r"SOFTWARE\iPhoneWebcam", "VCamLog").unwrap_or(0) == 0 {
+        return None;
     }
+    let dir = read_registry_string(r"SOFTWARE\iPhoneWebcam", "VCamLogDir")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!("iPhoneWebcamVCam-{}.log", std::process::id()));
+    std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
 }
 
 macro_rules! vlog {
@@ -74,24 +60,44 @@ macro_rules! vlog {
 }
 pub(crate) use vlog;
 
+fn read_registry_dword(key: &str, value: &str) -> Option<u32> {
+    let (key, value) = (wide(key), wide(value));
+    let mut data = 0u32;
+    let mut size = 4u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    (ok == ERROR_SUCCESS).then_some(data)
+}
+
 fn read_registry_string(key: &str, value: &str) -> Option<String> {
+    let (key, value) = (wide(key), wide(value));
     let mut buf = [0u16; 512];
     let mut size = (buf.len() * 2) as u32;
     let ok = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
-            PCWSTR(wide(key).as_ptr()),
-            PCWSTR(wide(value).as_ptr()),
+            PCWSTR(key.as_ptr()),
+            PCWSTR(value.as_ptr()),
             RRF_RT_REG_SZ,
             None,
             Some(buf.as_mut_ptr() as *mut c_void),
             Some(&mut size),
         )
     };
-    (ok == ERROR_SUCCESS).then(|| {
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        String::from_utf16_lossy(&buf[..len])
-    })
+    if ok != ERROR_SUCCESS {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
 }
 
 // ---------------------------------------------------------------- class factory
@@ -156,11 +162,12 @@ fn clsid_key() -> String {
 }
 
 fn set_string(key: &str, name: Option<&str>, value: &str) -> windows::core::Result<()> {
+    let key = wide(key);
     unsafe {
         let mut hkey = HKEY::default();
         RegCreateKeyExW(
             HKEY_LOCAL_MACHINE,
-            PCWSTR(wide(key).as_ptr()),
+            PCWSTR(key.as_ptr()),
             None,
             None,
             REG_OPTION_NON_VOLATILE,
@@ -172,14 +179,9 @@ fn set_string(key: &str, name: Option<&str>, value: &str) -> windows::core::Resu
         .ok()?;
         let data = wide(value);
         let name = name.map(wide);
+        let name_ptr = name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr()));
         let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2);
-        let result = RegSetValueExW(
-            hkey,
-            name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr())),
-            None,
-            REG_SZ,
-            Some(bytes),
-        );
+        let result = RegSetValueExW(hkey, name_ptr, None, REG_SZ, Some(bytes));
         let _ = windows::Win32::System::Registry::RegCloseKey(hkey);
         result.ok()
     }
@@ -189,7 +191,8 @@ fn set_string(key: &str, name: Option<&str>, value: &str) -> windows::core::Resu
 #[no_mangle]
 extern "system" fn DllRegisterServer() -> HRESULT {
     let mut path = [0u16; 1024];
-    let len = unsafe { GetModuleFileNameW(Some(HINSTANCE(MODULE.load(Ordering::Relaxed)).into()), &mut path) } as usize;
+    let module = HINSTANCE(MODULE.load(Ordering::Relaxed));
+    let len = unsafe { GetModuleFileNameW(Some(module.into()), &mut path) } as usize;
     if len == 0 {
         return windows::core::Error::from_thread().code();
     }
@@ -206,7 +209,8 @@ extern "system" fn DllRegisterServer() -> HRESULT {
 
 #[no_mangle]
 extern "system" fn DllUnregisterServer() -> HRESULT {
-    let status = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(wide(&clsid_key()).as_ptr())) };
+    let key = wide(&clsid_key());
+    let status = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(key.as_ptr())) };
     if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
         S_OK
     } else {

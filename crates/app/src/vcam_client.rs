@@ -54,16 +54,7 @@ impl VirtualCamera {
                 &HSTRING::from(fs::VCAM_CLSID),
                 Some(&categories),
             )
-            .map_err(|e| {
-                if e.code() == E_ACCESSDENIED {
-                    anyhow::anyhow!(
-                        "Windows blocked camera access ({e}). Turn on Settings > Privacy & security > Camera > \
-                         'Camera access' and 'Let desktop apps access your camera'."
-                    )
-                } else {
-                    anyhow::anyhow!("MFCreateVirtualCamera failed ({e}); run `iphone-webcam install` as administrator")
-                }
-            })?;
+            .map_err(explain_create_error)?;
             camera.Start(None).context("starting the virtual camera")?;
             Ok(Self { camera, name: name.to_string(), section: None, last_open_attempt: None })
         }
@@ -90,6 +81,17 @@ impl VirtualCamera {
             self.section = Some((handle, view));
             Some(view.Value as *mut u8)
         }
+    }
+}
+
+fn explain_create_error(e: windows::core::Error) -> anyhow::Error {
+    if e.code() == E_ACCESSDENIED {
+        anyhow::anyhow!(
+            "Windows blocked camera access ({e}). Turn on Settings > Privacy & security > Camera > \
+             'Camera access' and 'Let desktop apps access your camera'."
+        )
+    } else {
+        anyhow::anyhow!("MFCreateVirtualCamera failed ({e}); run `iphone-webcam install` as administrator")
     }
 }
 
