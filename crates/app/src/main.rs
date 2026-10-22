@@ -1,4 +1,4 @@
-//! iPhone Webcam: use an iPhone as a webcam on a Windows 11 PC.
+//! iPhone Webcam: use an iPhone as a webcam on a Windows 11 or Linux PC.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -56,9 +56,9 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Register the virtual camera and open the firewall (asks for administrator rights).
+    /// Set up the virtual camera and open the firewall (asks for administrator rights).
     Install {
-        /// Path to iPhoneWebcamVCam.dll (default: next to this program).
+        /// Windows: path to iPhoneWebcamVCam.dll (default: next to this program).
         #[arg(long)]
         dll: Option<PathBuf>,
     },
@@ -69,7 +69,10 @@ enum Cmd {
 fn default_data_dir() -> PathBuf {
     match std::env::var_os("APPDATA") {
         Some(appdata) => PathBuf::from(appdata).join("iPhoneWebcam"),
-        None => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".iphone-webcam"),
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".config"))
+            .join("iphone-webcam"),
     }
 }
 
@@ -105,8 +108,12 @@ fn main() -> Result<()> {
         Some(Cmd::Install { dll }) => std::process::exit(iphone_webcam::install::install(args.port, dll)?),
         #[cfg(windows)]
         Some(Cmd::Uninstall) => std::process::exit(iphone_webcam::install::uninstall()?),
-        #[cfg(not(windows))]
-        Some(_) => anyhow::bail!("install/uninstall are for Windows 11"),
+        #[cfg(target_os = "linux")]
+        Some(Cmd::Install { .. }) => std::process::exit(iphone_webcam::install::install(args.port, &args.camera_name)?),
+        #[cfg(target_os = "linux")]
+        Some(Cmd::Uninstall) => std::process::exit(iphone_webcam::install::uninstall(args.port, &args.camera_name)?),
+        #[cfg(not(any(windows, target_os = "linux")))]
+        Some(_) => anyhow::bail!("install/uninstall are for Windows 11 and Linux"),
         None => {}
     }
 

@@ -19,10 +19,14 @@ pub fn open(name: &str, width: u32, height: u32) -> anyhow::Result<Box<dyn Camer
     {
         return Ok(Box::new(crate::vcam_client::VirtualCamera::create(name, width, height)?));
     }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(Box::new(crate::v4l2::LoopbackCamera::open(name, width, height)?));
+    }
     #[allow(unreachable_code)]
     {
         let _ = (name, width, height);
-        anyhow::bail!("virtual cameras need Windows 11")
+        anyhow::bail!("virtual cameras need Windows 11 or Linux")
     }
 }
 

@@ -32,7 +32,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-          cargo test --workspace --features iphone-webcam/openh264
+          cargo test --workspace
 
       - name: Build release
         run: cargo build --release -p iphone-webcam -p vcam -p vcam-probe
@@ -66,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           $env:VCAM_PROBE = "$PWD\target\release\vcam-probe.exe"
-          cargo test -p iphone-webcam --features openh264 --test windows_camera -- --nocapture
+          cargo test -p iphone-webcam --test camera -- --nocapture
 
       - name: Virtual camera diagnostics
         if: always()

@@ -18,8 +18,8 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::hub::FrameHub;
+use crate::web_assets;
 use crate::webrtc::{self, RtcSession};
-use crate::{decode, web_assets};
 
 /// WebRTC start bitrate (bit/s): a clear 720p picture from the first second, low
 /// enough that a weak Wi-Fi link recovers quickly.
@@ -198,10 +198,6 @@ async fn status(State(server): State<Arc<Server>>) -> Response {
 
 /// WebRTC signalling: take the phone's offer, return our answer plus settings.
 async fn offer(State(server): State<Arc<Server>>, Json(request): Json<OfferRequest>) -> Response {
-    if !decode::available() {
-        // The page falls back to JPEG frames.
-        return (StatusCode::NOT_IMPLEMENTED, "no H.264 decoder in this build").into_response();
-    }
     *server.client_info.lock().unwrap() = request.info.clone();
     let weak = Arc::downgrade(&server);
     let on_end = move |id: u64| {

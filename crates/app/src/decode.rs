@@ -1,9 +1,8 @@
 //! H.264 decoding for the WebRTC stream.
 //!
 //! On Windows the decoder built into Media Foundation is used: it's hardware
-//! accelerated, ships with Windows, and Microsoft holds the patent license. The
-//! `openh264` feature adds Cisco's OpenH264 (built from source) for development and
-//! tests on other systems.
+//! accelerated, ships with Windows, and Microsoft holds the patent license. Elsewhere
+//! it's Cisco's OpenH264, built from source.
 
 use crate::hub::Yuv420;
 
@@ -18,30 +17,23 @@ pub fn new_decoder() -> anyhow::Result<Box<dyn VideoDecoder>> {
     {
         return Ok(Box::new(crate::mf_decode::MfH264Decoder::new()?));
     }
-    #[cfg(all(not(windows), feature = "openh264"))]
+    #[cfg(not(windows))]
     {
-        return Ok(Box::new(OpenH264::new()?));
+        Ok(Box::new(OpenH264::new()?))
     }
-    #[allow(unreachable_code)]
-    Err(anyhow::anyhow!("no H.264 decoder in this build (build with --features openh264)"))
 }
 
-/// Whether [`new_decoder`] can succeed, so WebRTC isn't offered when it can't.
-pub fn available() -> bool {
-    cfg!(any(windows, feature = "openh264"))
-}
-
-#[cfg(feature = "openh264")]
+#[cfg(not(windows))]
 pub struct OpenH264(openh264::decoder::Decoder);
 
-#[cfg(feature = "openh264")]
+#[cfg(not(windows))]
 impl OpenH264 {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self(openh264::decoder::Decoder::new()?))
     }
 }
 
-#[cfg(feature = "openh264")]
+#[cfg(not(windows))]
 impl VideoDecoder for OpenH264 {
     fn decode(&mut self, annex_b: &[u8], out: &mut dyn FnMut(&Yuv420)) -> anyhow::Result<()> {
         use openh264::formats::YUVSource;

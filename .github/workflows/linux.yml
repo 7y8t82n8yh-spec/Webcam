@@ -1,0 +1,65 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Build the phone page (Rust → WebAssembly)
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          cargo xtask web
+
+      - name: Tests (OpenH264 decoder, headless Chrome with a fake camera)
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release -p iphone-webcam
+
+      - name: Install v4l2loopback and the virtual camera
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg v4l2loopback-dkms "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)"
+          sudo target/release/iphone-webcam install
+          # The runner's user isn't in the video group.
+          sudo chmod 666 /dev/video*
+          ls -l /dev/video*
+
+      - name: Phone → WebRTC → v4l2loopback → ffmpeg
+        env:
+          CAMERA_E2E: "1"
+        run: cargo test -p iphone-webcam --test camera -- --nocapture
+
+      - name: Diagnostics
+        if: always()
+        run: sudo dmesg | grep -i v4l2 | tail -20 || true
+
+      - name: Uninstall
+        run: |
+          sudo target/release/iphone-webcam uninstall
+          test ! -e /etc/modprobe.d/iphone-webcam.conf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneWebcam-linux-x64
+          path: target/release/iphone-webcam

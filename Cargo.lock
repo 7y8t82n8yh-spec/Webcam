@@ -2193,6 +2193,7 @@ dependencies = [
  "futures-util",
  "if-addrs",
  "jpeg-encoder",
+ "libc",
  "openh264",
  "protocol",
  "qrcode",
