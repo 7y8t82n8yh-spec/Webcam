@@ -89,7 +89,9 @@ jobs:
         shell: pwsh
         run: |
           $env:VCAM_PROBE = "$PWD\target\release\vcam-probe.exe"
-          cargo test --release -p iphone-webcam --test camera -- --nocapture
+          # --workspace, like the build: selecting one package changes which features the
+          # shared libraries are built with, and recompiles them.
+          cargo test --release --workspace --test camera -- --nocapture
 
       - name: Virtual camera diagnostics
         if: always()

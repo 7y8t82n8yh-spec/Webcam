@@ -81,7 +81,9 @@ jobs:
         if: steps.v4l2.outputs.ready == 'true'
         env:
           CAMERA_E2E: "1"
-        run: cargo test --release -p iphone-webcam --test camera -- --nocapture
+        # --workspace, like the build: selecting one package changes which features the
+        # shared libraries are built with, and recompiles them.
+        run: cargo test --release --workspace --test camera -- --nocapture
 
       - name: Diagnostics
         if: always()
