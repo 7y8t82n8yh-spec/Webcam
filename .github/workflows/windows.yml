@@ -1,7 +1,9 @@
 name: Windows
 
 on:
+  # Branches are covered by their pull request; running on both doubles the work.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -10,6 +12,10 @@ jobs:
     runs-on: windows-2025
     env:
       CARGO_TERM_COLOR: always
+      # Tests and the uploaded build share the release profile, so everything compiles
+      # once. Faster settings than a real release: no LTO, parallel code generation.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v5
 
@@ -19,6 +25,10 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Save the cache (including the installed wasm-bindgen-cli) after failed
+          # runs too, otherwise every run after a failure compiles from scratch.
+          cache-on-failure: true
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -32,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-          cargo test --workspace --no-fail-fast
+          cargo test --release --workspace --no-fail-fast
 
       - name: Build release
         run: cargo build --release -p iphone-webcam -p vcam -p vcam-probe
@@ -66,7 +76,7 @@ jobs:
         shell: pwsh
         run: |
           $env:VCAM_PROBE = "$PWD\target\release\vcam-probe.exe"
-          cargo test -p iphone-webcam --test camera -- --nocapture
+          cargo test --release -p iphone-webcam --test camera -- --nocapture
 
       - name: Virtual camera diagnostics
         if: always()

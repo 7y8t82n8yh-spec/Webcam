@@ -1,7 +1,9 @@
 name: Linux
 
 on:
+  # Branches are covered by their pull request; running on both doubles the work.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -10,6 +12,10 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_TERM_COLOR: always
+      # Tests and the uploaded build share the release profile, so everything compiles
+      # once. Faster settings than a real release: no LTO, parallel code generation.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v5
 
@@ -19,6 +25,10 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Save the cache (including the installed wasm-bindgen-cli) after failed
+          # runs too, otherwise every run after a failure compiles from scratch.
+          cache-on-failure: true
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -31,7 +41,7 @@ jobs:
       - name: Tests (OpenH264 decoder, headless Chrome with a fake camera)
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --release --workspace --no-fail-fast
 
       - name: Build release
         run: cargo build --release -p iphone-webcam
@@ -48,7 +58,7 @@ jobs:
       - name: Phone → WebRTC → v4l2loopback → ffmpeg
         env:
           CAMERA_E2E: "1"
-        run: cargo test -p iphone-webcam --test camera -- --nocapture
+        run: cargo test --release -p iphone-webcam --test camera -- --nocapture
 
       - name: Diagnostics
         if: always()
