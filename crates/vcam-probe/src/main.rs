@@ -52,6 +52,8 @@ mod probe {
             let average = read_average(&reader, frames)?;
             println!("{:.1} {:.1} {:.1}", average[0], average[1], average[2]);
             let _ = source.Shutdown();
+            // Release every Media Foundation object before shutting it down.
+            drop((reader, source, activate));
             let _ = MFShutdown();
             Ok(())
         }

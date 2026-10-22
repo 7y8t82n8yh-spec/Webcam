@@ -10,6 +10,18 @@ use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPRO
 use crate::decode::VideoDecoder;
 use crate::hub::Yuv420;
 
+/// Start Media Foundation once for the whole process and leave it running.
+///
+/// Pairing MFStartup/MFShutdown per object is fragile: the shutdown in `Drop` runs
+/// before the object's COM fields are released, and releasing them after the last
+/// MFShutdown crashed (access violation) when a session ended.
+pub(crate) fn start_media_foundation() -> Result<()> {
+    static STARTED: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
+    let started =
+        STARTED.get_or_init(|| unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }.map_err(|e| e.to_string()));
+    started.clone().map_err(|e| anyhow::anyhow!("MFStartup: {e}"))
+}
+
 pub struct MfH264Decoder {
     transform: IMFTransform,
     /// Allocated picture size (height may be padded, e.g. 1088) and the visible size.
@@ -27,7 +39,7 @@ impl MfH264Decoder {
         unsafe {
             // Fine if this thread already joined the MTA.
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).context("MFStartup")?;
+            start_media_foundation()?;
             let transform: IMFTransform =
                 CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER).context("H.264 decoder")?;
             if let Ok(attributes) = transform.GetAttributes() {
@@ -188,7 +200,6 @@ impl Drop for MfH264Decoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = MFShutdown();
         }
     }
 }
