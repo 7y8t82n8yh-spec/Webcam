@@ -1,4 +1,5 @@
-//! Windows implementation: COM entry points, registration and diagnostics.
+//! Windows implementation: the COM entry points the camera service calls, and an
+//! optional diagnostic log. `iphone-webcam install` registers the class.
 
 mod activate;
 mod frames;
@@ -6,31 +7,15 @@ mod source;
 
 use std::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::{implement, Interface, BOOL, GUID, HRESULT, PCWSTR};
-use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_POINTER, HINSTANCE,
-    S_FALSE, S_OK,
-};
+use windows::core::{implement, Interface, BOOL, GUID, HRESULT};
+use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, S_FALSE};
 use windows::Win32::Media::MediaFoundation::IMFActivate;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
-use windows::Win32::System::Registry::{
-    RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE,
-    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
-};
-use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_core::Ref;
 
 const CLSID: GUID = GUID::from_u128(protocol::frame_section::VCAM_CLSID_U128);
-
-static MODULE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 // ---------------------------------------------------------------- diagnostics
 
@@ -40,17 +25,16 @@ fn wide(s: &str) -> Vec<u16> {
 pub(crate) fn log(message: std::fmt::Arguments) {
     static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     let Some(file) = FILE.get_or_init(open_log_file) else { return };
-    let Ok(mut f) = file.lock() else { return };
-    let _ = writeln!(f, "{:?} [{:?}] {}", std::time::SystemTime::now(), std::thread::current().id(), message);
+    let Ok(mut file) = file.lock() else { return };
+    let _ = writeln!(file, "{:?} [{:?}] {}", std::time::SystemTime::now(), std::thread::current().id(), message);
 }
 
 fn open_log_file() -> Option<Mutex<std::fs::File>> {
-    if read_registry_dword(r"SOFTWARE\iPhoneWebcam", "VCamLog").unwrap_or(0) == 0 {
+    let settings = windows_registry::LOCAL_MACHINE.open(r"SOFTWARE\iPhoneWebcam").ok()?;
+    if settings.get_u32("VCamLog").unwrap_or(0) == 0 {
         return None;
     }
-    let dir = read_registry_string(r"SOFTWARE\iPhoneWebcam", "VCamLogDir")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = settings.get_string("VCamLogDir").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     let path = dir.join(format!("iPhoneWebcamVCam-{}.log", std::process::id()));
     std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
 }
@@ -60,48 +44,9 @@ macro_rules! vlog {
 }
 pub(crate) use vlog;
 
-fn read_registry_dword(key: &str, value: &str) -> Option<u32> {
-    let (key, value) = (wide(key), wide(value));
-    let mut data = 0u32;
-    let mut size = 4u32;
-    let ok = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(key.as_ptr()),
-            PCWSTR(value.as_ptr()),
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut data as *mut u32 as *mut c_void),
-            Some(&mut size),
-        )
-    };
-    (ok == ERROR_SUCCESS).then_some(data)
-}
+// ---------------------------------------------------------------- COM entry points
 
-fn read_registry_string(key: &str, value: &str) -> Option<String> {
-    let (key, value) = (wide(key), wide(value));
-    let mut buf = [0u16; 512];
-    let mut size = (buf.len() * 2) as u32;
-    let ok = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(key.as_ptr()),
-            PCWSTR(value.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr() as *mut c_void),
-            Some(&mut size),
-        )
-    };
-    if ok != ERROR_SUCCESS {
-        return None;
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(String::from_utf16_lossy(&buf[..len]))
-}
-
-// ---------------------------------------------------------------- class factory
-
+/// Makes the `IMFActivate` the camera service asks for.
 #[implement(IClassFactory)]
 struct Factory;
 
@@ -115,11 +60,11 @@ impl IClassFactory_Impl for Factory_Impl {
         if object.is_null() {
             return Err(E_POINTER.into());
         }
-        unsafe { *object = std::ptr::null_mut() };
         if outer.is_some() {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
         let activate: IMFActivate = activate::Activate::new()?.into();
+        // SAFETY: COM passes a valid interface id and out pointer (checked above).
         unsafe { activate.query(iid, object).ok() }
     }
 
@@ -128,16 +73,10 @@ impl IClassFactory_Impl for Factory_Impl {
     }
 }
 
-// ---------------------------------------------------------------- DLL exports
-
-#[no_mangle]
-extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
-    if reason == DLL_PROCESS_ATTACH {
-        MODULE.store(instance.0, Ordering::Relaxed);
-    }
-    true.into()
-}
-
+/// COM asks the DLL for the factory of a class.
+///
+/// # Safety
+/// Called by COM with valid pointers (null ones are rejected).
 #[no_mangle]
 unsafe extern "system" fn DllGetClassObject(clsid: *const GUID, iid: *const GUID, object: *mut *mut c_void) -> HRESULT {
     if clsid.is_null() || iid.is_null() || object.is_null() {
@@ -155,65 +94,4 @@ unsafe extern "system" fn DllGetClassObject(clsid: *const GUID, iid: *const GUID
 #[no_mangle]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE
-}
-
-fn clsid_key() -> String {
-    format!(r"SOFTWARE\Classes\CLSID\{}", protocol::frame_section::VCAM_CLSID)
-}
-
-fn set_string(key: &str, name: Option<&str>, value: &str) -> windows::core::Result<()> {
-    let key = wide(key);
-    unsafe {
-        let mut hkey = HKEY::default();
-        RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(key.as_ptr()),
-            None,
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_WRITE,
-            None,
-            &mut hkey,
-            None,
-        )
-        .ok()?;
-        let data = wide(value);
-        let name = name.map(wide);
-        let name_ptr = name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr()));
-        let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2);
-        let result = RegSetValueExW(hkey, name_ptr, None, REG_SZ, Some(bytes));
-        let _ = windows::Win32::System::Registry::RegCloseKey(hkey);
-        result.ok()
-    }
-}
-
-/// `regsvr32`: register the COM class machine-wide so the Frame Server service can load it.
-#[no_mangle]
-extern "system" fn DllRegisterServer() -> HRESULT {
-    let mut path = [0u16; 1024];
-    let module = HINSTANCE(MODULE.load(Ordering::Relaxed));
-    let len = unsafe { GetModuleFileNameW(Some(module.into()), &mut path) } as usize;
-    if len == 0 {
-        return windows::core::Error::from_thread().code();
-    }
-    let path = String::from_utf16_lossy(&path[..len]);
-    let server = format!(r"{}\InprocServer32", clsid_key());
-    let result = set_string(&clsid_key(), None, "iPhone Webcam virtual camera")
-        .and_then(|_| set_string(&server, None, &path))
-        .and_then(|_| set_string(&server, Some("ThreadingModel"), "Both"));
-    match result {
-        Ok(()) => S_OK,
-        Err(e) => e.code(),
-    }
-}
-
-#[no_mangle]
-extern "system" fn DllUnregisterServer() -> HRESULT {
-    let key = wide(&clsid_key());
-    let status = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(key.as_ptr())) };
-    if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
-        S_OK
-    } else {
-        status.to_hresult()
-    }
 }

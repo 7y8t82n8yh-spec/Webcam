@@ -52,9 +52,10 @@ struct Args {
     no_gui: bool,
     #[arg(short, long)]
     verbose: bool,
-    /// Wait for Enter before exiting with an error (set when re-run elevated).
+    /// Set on the copy that install/uninstall start with administrator rights: its
+    /// console window closes on exit, so it waits for Enter after an error.
     #[arg(long, hide = true, global = true)]
-    pause_on_error: bool,
+    elevated: bool,
 }
 
 #[derive(Subcommand)]
@@ -113,12 +114,12 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Some(Cmd::Install { dll }) => {
             let result = iphone_webcam::install::install(args.port, dll);
-            std::process::exit(pause_on_error(args.pause_on_error, result)?)
+            std::process::exit(pause_on_error(args.elevated, result)?)
         }
         #[cfg(windows)]
         Some(Cmd::Uninstall) => {
             let result = iphone_webcam::install::uninstall();
-            std::process::exit(pause_on_error(args.pause_on_error, result)?)
+            std::process::exit(pause_on_error(args.elevated, result)?)
         }
         #[cfg(target_os = "linux")]
         Some(Cmd::Install { .. }) => std::process::exit(iphone_webcam::install::install(args.port, &args.camera_name)?),

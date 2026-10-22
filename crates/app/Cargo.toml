@@ -42,21 +42,15 @@ tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"]
 # WebRTC crypto: Windows' own (CNG) on Windows, pure Rust elsewhere.
 [target.'cfg(windows)'.dependencies]
 str0m = { version = "0.24.1", default-features = false, features = ["wincrypto"] }
+windows-registry = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_KernelStreaming",
     "Win32_Media_MediaFoundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
     "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
-    "Win32_System_Registry",
-    "Win32_System_Variant",
-    "Win32_System_Threading",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # H.264 decoding: Media Foundation on Windows, OpenH264 elsewhere.

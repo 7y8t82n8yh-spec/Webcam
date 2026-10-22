@@ -2211,6 +2211,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "windows-registry",
  "x509-parser",
  "zune-jpeg",
 ]
@@ -4760,6 +4761,7 @@ dependencies = [
  "protocol",
  "windows",
  "windows-core",
+ "windows-registry",
 ]
 
 [[package]]

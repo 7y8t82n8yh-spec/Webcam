@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use protocol::frame_section::{self as fs, Header};
-use windows::core::PCWSTR;
+use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
@@ -14,7 +14,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
-use super::{vlog, wide};
+use super::vlog;
 
 /// After this long without a write the app is gone: show black, not a frozen frame.
 const STALE_MS: u64 = 3000;
@@ -126,27 +126,16 @@ unsafe fn create_or_open_section() -> Option<HANDLE> {
     // low integrity label lets the (medium integrity) app write to a section
     // created by a service. We only ever read it.
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;LW)");
-    let _ = ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        PCWSTR(sddl.as_ptr()),
-        SDDL_REVISION_1,
-        &mut descriptor,
-        None,
-    );
+    let sddl = w!("D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;LW)");
+    let _ = ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &mut descriptor, None);
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: false.into(),
     };
-    let name = wide(fs::SECTION_NAME);
-    let created = CreateFileMappingW(
-        INVALID_HANDLE_VALUE,
-        Some(&attributes),
-        PAGE_READWRITE,
-        0,
-        fs::SECTION_SIZE as u32,
-        PCWSTR(name.as_ptr()),
-    );
+    let name = HSTRING::from(fs::SECTION_NAME);
+    let created =
+        CreateFileMappingW(INVALID_HANDLE_VALUE, Some(&attributes), PAGE_READWRITE, 0, fs::SECTION_SIZE as u32, &name);
     if !descriptor.0.is_null() {
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
     }
@@ -154,7 +143,7 @@ unsafe fn create_or_open_section() -> Option<HANDLE> {
     // can't create Global objects: open what's there, read-only.
     match created {
         Ok(h) => Some(h),
-        Err(_) => OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())).ok(),
+        Err(_) => OpenFileMappingW(FILE_MAP_READ.0, false, &name).ok(),
     }
 }
 
