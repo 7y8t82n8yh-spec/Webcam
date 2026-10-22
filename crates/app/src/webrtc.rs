@@ -47,72 +47,22 @@ impl RtcSession {
     }
 }
 
-/// Add libwebrtc's start-bitrate hint to every video codec in an SDP answer.
+/// Add libwebrtc's start-bitrate hint to the video codecs of our SDP answer.
 ///
 /// Without it the phone starts around 300 kbit/s and needs ~30 s of bandwidth probing
 /// to reach full quality. Senders still back off quickly if the network can't carry it.
+/// Every codec in our answer has an fmtp line (H.264 always carries its profile);
+/// the retransmission (rtx) ones are recognisable by their `apt=`.
 pub fn with_start_bitrate(sdp: &str, kbps: u32) -> String {
-    let hint = format!("x-google-start-bitrate={kbps}");
-    let mut out: Vec<String> = Vec::new();
-    let mut in_video = false;
-    let mut section = VideoSection::default();
+    let mut out = String::new();
     for line in sdp.lines() {
-        let mut line = line.to_string();
-        if line.starts_with("m=") {
-            section.finish(&mut out, &hint);
-            in_video = line.starts_with("m=video");
-        } else if in_video {
-            section.attribute(&mut line, out.len(), &hint);
+        out.push_str(line);
+        if line.starts_with("a=fmtp:") && !line.contains("apt=") {
+            out.push_str(&format!(";x-google-start-bitrate={kbps}"));
         }
-        out.push(line);
+        out.push_str("\r\n");
     }
-    section.finish(&mut out, &hint);
-    let mut sdp = out.join("\r\n");
-    sdp.push_str("\r\n");
-    sdp
-}
-
-/// The codecs of the video section being rewritten.
-#[derive(Default)]
-struct VideoSection {
-    /// Payload type -> index of its rtpmap line in the output.
-    codecs: Vec<(String, usize)>,
-    /// Payload types that have an fmtp line.
-    with_fmtp: Vec<String>,
-}
-
-impl VideoSection {
-    /// Look at an attribute line that goes to output index `index`: note codecs, and add
-    /// `hint` to their fmtp lines.
-    fn attribute(&mut self, line: &mut String, index: usize, hint: &str) {
-        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
-            let (pt, codec) = rest.split_once(' ').unwrap_or((rest, ""));
-            let name = codec.split('/').next().unwrap_or("").to_ascii_lowercase();
-            if !["rtx", "red", "ulpfec", "flexfec-03"].contains(&name.as_str()) {
-                self.codecs.push((pt.to_string(), index));
-            }
-            return;
-        }
-        let Some(rest) = line.strip_prefix("a=fmtp:") else { return };
-        let pt = rest.split(' ').next().unwrap_or("").to_string();
-        if self.codecs.iter().any(|(p, _)| *p == pt) {
-            line.push(';');
-            line.push_str(hint);
-            self.with_fmtp.push(pt);
-        }
-    }
-
-    /// End of the section: codecs without an fmtp line get one right after their rtpmap
-    /// (back to front so the recorded indices stay valid).
-    fn finish(&mut self, out: &mut Vec<String>, hint: &str) {
-        for (pt, idx) in self.codecs.iter().rev() {
-            if !self.with_fmtp.contains(pt) {
-                out.insert(idx + 1, format!("a=fmtp:{pt} {hint}"));
-            }
-        }
-        self.codecs.clear();
-        self.with_fmtp.clear();
-    }
+    out
 }
 
 fn rtc_config() -> RtcConfig {
@@ -181,10 +131,13 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     hub: Arc<FrameHub>,
 ) -> Result<()> {
-    // Datagrams from all sockets are funnelled into one channel.
+    // Datagrams from all sockets are funnelled into one channel. The readers stop when
+    // `readers` is dropped.
     let (packet_tx, mut packets) = mpsc::channel::<Packet>(256);
-    let readers = sockets.iter().map(|socket| tokio::spawn(read_socket(socket.clone(), packet_tx.clone()))).collect();
-    let _abort_readers = AbortOnDrop(readers);
+    let mut readers = tokio::task::JoinSet::new();
+    for socket in &sockets {
+        readers.spawn(read_socket(socket.clone(), packet_tx.clone()));
+    }
 
     let (keyframe_tx, mut keyframe_requests) = mpsc::unbounded_channel::<()>();
     let decoder = DecoderThread::spawn(hub, keyframe_tx)?;
@@ -311,16 +264,6 @@ impl Connection {
     }
 }
 
-struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
-    }
-}
-
 /// Decodes frames on a dedicated thread so the network loop never waits for it.
 struct DecoderThread {
     frames: std_mpsc::Sender<Encoded>,
@@ -386,19 +329,23 @@ struct Encoded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use str0m::media::{Direction, MediaKind};
 
     #[test]
-    fn start_bitrate_hint_is_added_to_every_video_codec() {
-        let sdp = "v=0\r\nm=audio 9 UDP 0\r\na=rtpmap:0 PCMU/8000\r\n\
-                   m=video 9 UDP 96 97 102\r\na=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack\r\n\
-                   a=rtpmap:97 rtx/90000\r\na=fmtp:97 apt=96\r\n\
-                   a=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=1\r\n";
-        let out = with_start_bitrate(sdp, 2500);
-        let lines: Vec<&str> = out.split("\r\n").collect();
-        let vp8 = lines.iter().position(|l| *l == "a=rtpmap:96 VP8/90000").unwrap();
-        assert_eq!(lines[vp8 + 1], "a=fmtp:96 x-google-start-bitrate=2500");
-        assert!(lines.contains(&"a=fmtp:102 packetization-mode=1;x-google-start-bitrate=2500"));
-        assert!(lines.contains(&"a=fmtp:97 apt=96"));
-        assert!(!lines.iter().any(|l| l.starts_with("a=fmtp:0")));
+    fn our_answer_gets_the_start_bitrate_hint() {
+        // An offer like the phone's, answered the way `start` does.
+        let mut phone = Rtc::new(Instant::now());
+        let mut changes = phone.sdp_api();
+        changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, _) = changes.apply().unwrap();
+        let answer = rtc_config().build(Instant::now()).sdp_api().accept_offer(offer).unwrap();
+        let sdp = with_start_bitrate(&answer.to_sdp_string(), 2500);
+
+        let fmtp: Vec<&str> = sdp.lines().filter(|l| l.starts_with("a=fmtp:")).collect();
+        let h264 = fmtp.iter().filter(|l| l.contains("profile-level-id")).count();
+        assert!(h264 > 0, "{sdp}");
+        for line in fmtp {
+            assert_eq!(line.contains("x-google-start-bitrate=2500"), !line.contains("apt="), "{line}");
+        }
     }
 }
