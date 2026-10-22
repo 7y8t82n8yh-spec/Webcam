@@ -2,6 +2,7 @@
 //! named after the camera, now and at every boot, and open the HTTPS port in ufw or
 //! firewalld when one of them is active.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -22,22 +23,21 @@ fn output(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// Re-run this command with sudo unless already root.
-fn ensure_root() -> Option<Result<i32>> {
-    if unsafe { libc::geteuid() } == 0 {
-        return None;
-    }
+/// Whether we run as root: `/proc/self` belongs to the process's effective user.
+fn is_root() -> bool {
+    std::fs::metadata("/proc/self").is_ok_and(|proc_self| proc_self.uid() == 0)
+}
+
+/// Run this same command again through sudo and return its exit code.
+fn rerun_with_sudo() -> Result<i32> {
     println!("Administrator rights are needed; running with sudo...");
-    let run = || -> Result<i32> {
-        let exe = std::env::current_exe()?;
-        let status = Command::new("sudo").arg(exe).args(std::env::args_os().skip(1)).status()?;
-        Ok(status.code().unwrap_or(1))
-    };
-    Some(run().context("running sudo"))
+    let exe = std::env::current_exe()?;
+    let status = Command::new("sudo").arg(exe).args(std::env::args_os().skip(1)).status().context("running sudo")?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn ours_loaded(name: &str) -> bool {
-    crate::v4l2::loopback_devices().iter().any(|(_, label)| label == name)
+    crate::v4l2::loopback_devices().iter().any(|device| device.label == name)
 }
 
 fn ufw_active() -> bool {
@@ -49,8 +49,8 @@ fn firewalld_running() -> bool {
 }
 
 pub fn install(port: u16, name: &str) -> Result<i32> {
-    if let Some(result) = ensure_root() {
-        return result;
+    if !is_root() {
+        return rerun_with_sudo();
     }
     if !run("modinfo", &["v4l2loopback"]) {
         bail!(
@@ -79,7 +79,7 @@ pub fn install(port: u16, name: &str) -> Result<i32> {
         }
     }
     match crate::v4l2::loopback_devices().first() {
-        Some((path, label)) => println!("Camera device: {} ({label}).", path.display()),
+        Some(device) => println!("Camera device: {} ({}).", device.path.display(), device.label),
         None => println!("No loopback device appeared yet; check `dmesg`."),
     }
 
@@ -97,8 +97,8 @@ pub fn install(port: u16, name: &str) -> Result<i32> {
 }
 
 pub fn uninstall(port: u16, name: &str) -> Result<i32> {
-    if let Some(result) = ensure_root() {
-        return result;
+    if !is_root() {
+        return rerun_with_sudo();
     }
     let _ = std::fs::remove_file(MODPROBE_CONF);
     let _ = std::fs::remove_file(MODULES_LOAD);

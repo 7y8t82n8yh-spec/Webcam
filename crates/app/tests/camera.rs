@@ -82,11 +82,11 @@ fn read_camera() -> Option<CameraReading> {
     std::env::var_os("CAMERA_E2E")?;
     let devices = iphone_webcam::v4l2::loopback_devices();
     // Prefer our device by its label; otherwise the first loopback device.
-    let ours = devices.iter().find(|(_, label)| label == CAMERA_NAME);
-    let (device, _) = ours.or(devices.first())?;
+    let ours = devices.iter().find(|device| device.label == CAMERA_NAME);
+    let device = ours.or(devices.first())?;
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-f", "v4l2", "-i"])
-        .arg(device)
+        .arg(&device.path)
         .args(["-frames:v", FFMPEG_FRAMES, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         .output()
         .expect("run ffmpeg");

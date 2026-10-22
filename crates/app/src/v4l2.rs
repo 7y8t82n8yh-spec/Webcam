@@ -5,36 +5,108 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::camera::CameraSink;
 use crate::hub::Frame;
 
-const BUF_TYPE_VIDEO_OUTPUT: u32 = 2;
-const FIELD_NONE: u32 = 1;
-const COLORSPACE_SMPTE170M: u32 = 1; // BT.601, matching the conversion below
-const PIX_FMT_YUYV: u32 = u32::from_le_bytes(*b"YUYV");
-
-/// `struct v4l2_capability`.
-#[repr(C)]
-struct Capability {
-    driver: [u8; 16],
-    card: [u8; 32],
-    bus_info: [u8; 32],
-    version: u32,
-    capabilities: u32,
-    device_caps: u32,
-    reserved: [u32; 3],
+pub struct LoopbackDevice {
+    pub path: PathBuf,
+    pub label: String,
 }
 
-/// `struct v4l2_format` with the `pix` member of its union (the union is 200 bytes and
-/// pointer aligned, hence the padding after `type`).
+/// The v4l2loopback devices, in device order.
+///
+/// sysfs says which they are: only v4l2loopback devices have a `max_openers` attribute.
+pub fn loopback_devices() -> Vec<LoopbackDevice> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") else { return Vec::new() };
+    let mut devices = Vec::new();
+    for entry in entries.flatten() {
+        let sysfs = entry.path();
+        if !sysfs.join("max_openers").exists() {
+            continue;
+        }
+        let label = std::fs::read_to_string(sysfs.join("name")).unwrap_or_default();
+        devices
+            .push(LoopbackDevice { path: PathBuf::from("/dev").join(entry.file_name()), label: label.trim().into() });
+    }
+    // video2 before video10.
+    devices.sort_by_key(|device| {
+        let name = device.path.to_string_lossy();
+        name.trim_start_matches("/dev/video").parse::<u32>().unwrap_or(u32::MAX)
+    });
+    devices
+}
+
+pub struct LoopbackCamera {
+    file: File,
+    device: LoopbackDevice,
+    width: u32,
+    height: u32,
+    yuyv: Vec<u8>,
+}
+
+impl LoopbackCamera {
+    /// Open the loopback device labelled `name`, else the first one there is.
+    pub fn open(name: &str, width: u32, height: u32) -> Result<Self> {
+        let mut devices = loopback_devices();
+        if devices.is_empty() {
+            bail!("no v4l2loopback device: run `sudo iphone-webcam install` (needs the v4l2loopback module)");
+        }
+        let index = devices.iter().position(|device| device.label == name).unwrap_or(0);
+        let device = devices.swap_remove(index);
+
+        let file =
+            OpenOptions::new().write(true).open(&device.path).with_context(|| device.path.display().to_string())?;
+        let mut format = Format::yuyv(width, height);
+        set_format(&file, &mut format).with_context(|| format!("setting the format of {}", device.path.display()))?;
+        // The device may adjust the request; the frames we write must match what it settled on.
+        ensure!(
+            format.width == width && format.height == height && format.pixelformat == PIX_FMT_YUYV,
+            "{} refused {width}x{height} YUYV (in use by another program?)",
+            device.path.display()
+        );
+        Ok(Self { file, device, width, height, yuyv: vec![0; (width * height * 2) as usize] })
+    }
+}
+
+impl CameraSink for LoopbackCamera {
+    fn send(&mut self, frame: &Frame) -> Result<()> {
+        ensure!(frame.width == self.width && frame.height == self.height, "frame size changed");
+        rgb_to_yuyv(&frame.rgb, &mut self.yuyv);
+        self.file.write_all(&self.yuyv).with_context(|| format!("writing to {}", self.device.path.display()))
+    }
+
+    fn describe(&self) -> String {
+        format!("{} ({})", self.device.label, self.device.path.display())
+    }
+}
+
+/// RGB24 to YUYV (BT.601, limited range); the two pixels of a pair share U and V.
+pub fn rgb_to_yuyv(rgb: &[u8], yuyv: &mut [u8]) {
+    let luma = |r: i32, g: i32, b: i32| (16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)) as u8;
+    for (pair, out) in rgb.chunks_exact(6).zip(yuyv.chunks_exact_mut(4)) {
+        let [r0, g0, b0, r1, g1, b1] = [0, 1, 2, 3, 4, 5].map(|i| pair[i] as i32);
+        let (r, g, b) = ((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2);
+        out[0] = luma(r0, g0, b0);
+        out[1] = (128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8)) as u8;
+        out[2] = luma(r1, g1, b1);
+        out[3] = (128 + ((112 * r - 94 * g - 18 * b + 128) >> 8)) as u8;
+    }
+}
+
+// ---------------------------------------------------------------- the one ioctl
+
+const PIX_FMT_YUYV: u32 = u32::from_le_bytes(*b"YUYV");
+
+/// `struct v4l2_format` holding a `v4l2_pix_format`. The kernel's union is 200 bytes
+/// and pointer aligned, hence the padding after `kind`.
 #[repr(C)]
 struct Format {
     kind: u32,
-    _pad: u32,
+    _padding: u32,
     width: u32,
     height: u32,
     pixelformat: u32,
@@ -47,122 +119,42 @@ struct Format {
     ycbcr_enc: u32,
     quantization: u32,
     xfer_func: u32,
-    _rest: [u8; 200 - 48],
+    _rest: [u8; 152],
 }
 
-const fn ioc(dir: u64, nr: u64, size: usize) -> u64 {
-    (dir << 30) | ((size as u64) << 16) | ((b'V' as u64) << 8) | nr
-}
-const VIDIOC_QUERYCAP: u64 = ioc(2, 0, std::mem::size_of::<Capability>());
-const VIDIOC_S_FMT: u64 = ioc(3, 5, std::mem::size_of::<Format>());
-
-fn c_str(bytes: &[u8]) -> String {
-    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..len]).into_owned()
-}
-
-/// Driver and card name of a video device.
-fn query(file: &File) -> Option<(String, String)> {
-    let mut cap: Capability = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(file.as_raw_fd(), VIDIOC_QUERYCAP as _, &mut cap) } == 0;
-    ok.then(|| (c_str(&cap.driver), c_str(&cap.card)))
-}
-
-/// v4l2loopback devices as (path, label), in device order.
-pub fn loopback_devices() -> Vec<(PathBuf, String)> {
-    let Ok(dir) = std::fs::read_dir("/dev") else { return Vec::new() };
-    let mut paths: Vec<PathBuf> =
-        dir.flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().starts_with("/dev/video")).collect();
-    paths.sort_by_key(|p| device_number(p));
-    paths.into_iter().filter_map(loopback_label).collect()
-}
-
-/// N of `/dev/videoN`, for sorting.
-fn device_number(path: &Path) -> u32 {
-    path.to_string_lossy().trim_start_matches("/dev/video").parse::<u32>().unwrap_or(u32::MAX)
-}
-
-/// `(path, label)` if `path` is a v4l2loopback device.
-fn loopback_label(path: PathBuf) -> Option<(PathBuf, String)> {
-    let file = OpenOptions::new().read(true).write(true).open(&path).ok()?;
-    let (driver, card) = query(&file)?;
-    (driver == "v4l2 loopback").then_some((path, card))
-}
-
-pub struct LoopbackCamera {
-    file: File,
-    path: PathBuf,
-    label: String,
-    width: u32,
-    height: u32,
-    buffer: Vec<u8>,
-}
-
-impl LoopbackCamera {
-    /// Open the loopback device labelled `name`, else the first one there is.
-    pub fn open(name: &str, width: u32, height: u32) -> Result<Self> {
-        let devices = loopback_devices();
-        let Some((path, label)) = devices.iter().find(|(_, label)| label == name).or_else(|| devices.first()).cloned()
-        else {
-            bail!("no v4l2loopback device: run `sudo iphone-webcam install` (needs the v4l2loopback module)");
-        };
-        Self::open_device(&path, &label, width, height)
-    }
-
-    fn open_device(path: &Path, label: &str, width: u32, height: u32) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path).with_context(|| path.display().to_string())?;
-        let mut format: Format = unsafe { std::mem::zeroed() };
-        format.kind = BUF_TYPE_VIDEO_OUTPUT;
-        format.width = width;
-        format.height = height;
-        format.pixelformat = PIX_FMT_YUYV;
-        format.field = FIELD_NONE;
-        format.bytesperline = width * 2;
-        format.sizeimage = width * height * 2;
-        format.colorspace = COLORSPACE_SMPTE170M;
-        if unsafe { libc::ioctl(file.as_raw_fd(), VIDIOC_S_FMT as _, &mut format) } != 0 {
-            return Err(std::io::Error::last_os_error()).context(format!("setting the format of {}", path.display()));
-        }
-        // The device may round the size; the writes must match what it settled on.
-        anyhow::ensure!(
-            format.width == width && format.height == height && format.pixelformat == PIX_FMT_YUYV,
-            "{} refused {width}x{height} YUYV (in use by another program?)",
-            path.display()
-        );
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            label: label.to_string(),
+impl Format {
+    fn yuyv(width: u32, height: u32) -> Self {
+        Format {
+            kind: 2, // V4L2_BUF_TYPE_VIDEO_OUTPUT
+            _padding: 0,
             width,
             height,
-            buffer: vec![0; (width * height * 2) as usize],
-        })
+            pixelformat: PIX_FMT_YUYV,
+            field: 1, // V4L2_FIELD_NONE
+            bytesperline: width * 2,
+            sizeimage: width * height * 2,
+            colorspace: 1, // V4L2_COLORSPACE_SMPTE170M: BT.601, as rgb_to_yuyv converts
+            private: 0,
+            flags: 0,
+            ycbcr_enc: 0,
+            quantization: 0,
+            xfer_func: 0,
+            _rest: [0; 152],
+        }
     }
 }
 
-/// RGB24 to YUYV (BT.601, limited range); the two pixels of a pair share U and V.
-pub fn rgb_to_yuyv(rgb: &[u8], out: &mut [u8]) {
-    for (pair, dst) in rgb.chunks_exact(6).zip(out.chunks_exact_mut(4)) {
-        let y = |r: i32, g: i32, b: i32| (16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)) as u8;
-        let (r0, g0, b0) = (pair[0] as i32, pair[1] as i32, pair[2] as i32);
-        let (r1, g1, b1) = (pair[3] as i32, pair[4] as i32, pair[5] as i32);
-        let (r, g, b) = ((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2);
-        dst[0] = y(r0, g0, b0);
-        dst[1] = (128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8)) as u8;
-        dst[2] = y(r1, g1, b1);
-        dst[3] = (128 + ((112 * r - 94 * g - 18 * b + 128) >> 8)) as u8;
-    }
-}
+/// `_IOWR('V', 5, struct v4l2_format)`
+const VIDIOC_S_FMT: u64 = (3 << 30) | ((std::mem::size_of::<Format>() as u64) << 16) | ((b'V' as u64) << 8) | 5;
 
-impl CameraSink for LoopbackCamera {
-    fn send(&mut self, frame: &Frame) -> Result<()> {
-        anyhow::ensure!(frame.width == self.width && frame.height == self.height, "frame size changed");
-        rgb_to_yuyv(&frame.rgb, &mut self.buffer);
-        self.file.write_all(&self.buffer).with_context(|| format!("writing to {}", self.path.display()))
-    }
-
-    fn describe(&self) -> String {
-        format!("{} ({})", self.label, self.path.display())
+fn set_format(device: &File, format: &mut Format) -> std::io::Result<()> {
+    // SAFETY: VIDIOC_S_FMT reads and writes exactly one `struct v4l2_format`, which
+    // `Format` matches (checked in the tests), and `format` is valid for the call.
+    let result = unsafe { libc::ioctl(device.as_raw_fd(), VIDIOC_S_FMT as _, format as *mut Format) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -171,10 +163,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn struct_layouts_match_the_kernel() {
-        assert_eq!(std::mem::size_of::<Capability>(), 104);
+    fn format_matches_the_kernel() {
         assert_eq!(std::mem::size_of::<Format>(), 208);
-        assert_eq!(VIDIOC_QUERYCAP, 0x8068_5600);
         assert_eq!(VIDIOC_S_FMT, 0xc0d0_5605);
     }
 
