@@ -46,13 +46,16 @@ jobs:
       - name: Build the phone page (Rust → WebAssembly)
         run: cargo xtask web
 
+      # Everything, tests included, in one compile. Building only the programs would
+      # compile shared libraries a second time: the tests' dev-dependencies switch
+      # extra features on in them (tokio, rustls...), which changes the build.
+      - name: Build (release, all targets)
+        run: cargo build --release --workspace --all-targets
+
       - name: Tests (OpenH264 decoder, headless Chrome with a fake camera)
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: cargo test --release --workspace --no-fail-fast
-
-      - name: Build release
-        run: cargo build --release -p iphone-webcam
 
       - name: Install v4l2loopback and the virtual camera
         run: |

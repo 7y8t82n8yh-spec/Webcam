@@ -48,14 +48,17 @@ jobs:
       - name: Build the phone page (Rust → WebAssembly)
         run: cargo xtask web
 
+      # Everything, tests included, in one compile. Building only the programs would
+      # compile shared libraries a second time: the tests' dev-dependencies switch
+      # extra features on in them (tokio, rustls...), which changes the build.
+      - name: Build (release, all targets)
+        run: cargo build --release --workspace --all-targets
+
       - name: Tests (Media Foundation decoder, headless Chrome with a fake camera)
         shell: pwsh
         run: |
           $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
           cargo test --release --workspace --no-fail-fast
-
-      - name: Build release
-        run: cargo build --release -p iphone-webcam -p vcam -p vcam-probe
 
       - name: Install the virtual camera
         run: target\release\iphone-webcam.exe install --dll target\release\iPhoneWebcamVCam.dll
