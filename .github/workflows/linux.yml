@@ -58,15 +58,27 @@ jobs:
         run: cargo test --release --workspace --no-fail-fast
 
       - name: Install v4l2loopback and the virtual camera
+        id: v4l2
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg v4l2loopback-dkms "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)"
+          sudo apt-get install -y ffmpeg v4l2loopback-dkms "linux-headers-$(uname -r)"
+          # v4l2loopback needs the kernel's video driver (videodev), shipped in the
+          # modules-extra package. Runners boot different kernels, and Ubuntu doesn't
+          # always publish that package for brand-new ones.
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          if ! modinfo videodev > /dev/null 2>&1; then
+            echo "::warning::Kernel $(uname -r) has no video driver package; skipping the Linux camera test"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sudo target/release/iphone-webcam install
           # The runner's user isn't in the video group.
           sudo chmod 666 /dev/video*
           ls -l /dev/video*
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Phone → WebRTC → v4l2loopback → ffmpeg
+        if: steps.v4l2.outputs.ready == 'true'
         env:
           CAMERA_E2E: "1"
         run: cargo test --release -p iphone-webcam --test camera -- --nocapture
@@ -76,6 +88,7 @@ jobs:
         run: sudo dmesg | grep -i v4l2 | tail -20 || true
 
       - name: Uninstall
+        if: steps.v4l2.outputs.ready == 'true'
         run: |
           sudo target/release/iphone-webcam uninstall
           test ! -e /etc/modprobe.d/iphone-webcam.conf
