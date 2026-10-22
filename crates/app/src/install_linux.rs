@@ -48,7 +48,8 @@ fn firewalld_running() -> bool {
     output("firewall-cmd", &["--state"]).trim() == "running"
 }
 
-pub fn install(port: u16, name: &str) -> Result<i32> {
+/// `dll` is only used on Windows.
+pub fn install(port: u16, name: &str, _dll: Option<std::path::PathBuf>) -> Result<i32> {
     if !is_root() {
         return rerun_with_sudo();
     }

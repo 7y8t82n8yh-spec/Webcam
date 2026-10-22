@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rcgen::{
@@ -41,7 +41,6 @@ pub struct Certificates {
     pub server_cert_pem: Vec<u8>,
     pub server_key_pem: Vec<u8>,
     pub ca_cert_der: Vec<u8>,
-    pub ca_cert_path: PathBuf,
 }
 
 /// Records what the current server certificate was issued for.
@@ -52,7 +51,7 @@ struct ServerMeta {
     not_after_unix: i64,
 }
 
-pub fn permitted(ip: IpAddr) -> bool {
+fn permitted(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => PERMITTED_NETWORKS.iter().any(|(net, prefix)| in_network(v4, *net, *prefix)),
         IpAddr::V6(_) => false,
@@ -140,7 +139,6 @@ pub fn ensure(dir: &Path, ips: &[IpAddr]) -> Result<Certificates> {
         server_cert_pem: fs::read(dir.join("server.crt"))?,
         server_key_pem: fs::read(dir.join("server.key"))?,
         ca_cert_der: ca_der,
-        ca_cert_path: dir.join("ca.crt"),
     })
 }
 

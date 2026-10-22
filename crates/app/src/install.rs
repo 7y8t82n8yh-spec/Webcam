@@ -12,7 +12,9 @@ const DLL_NAME: &str = "iPhoneWebcamVCam.dll";
 const TCP_RULE: &str = "iPhone Webcam";
 const UDP_RULE: &str = "iPhone Webcam (WebRTC video)";
 
-pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
+/// `camera_name` is only used on Linux: on Windows the app names the camera when it
+/// creates it.
+pub fn install(port: u16, _camera_name: &str, dll: Option<PathBuf>) -> Result<i32> {
     let dll = find_dll(dll)?;
     if !is_admin() {
         // The elevated copy starts in System32, hence the absolute DLL path.
@@ -64,7 +66,7 @@ pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
     Ok(0)
 }
 
-pub fn uninstall() -> Result<i32> {
+pub fn uninstall(_port: u16, _camera_name: &str) -> Result<i32> {
     if !is_admin() {
         return run_elevated("--elevated uninstall");
     }

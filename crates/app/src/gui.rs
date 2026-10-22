@@ -15,7 +15,14 @@ struct Window {
     qr: Option<(usize, TextureHandle)>,
     preview: Option<TextureHandle>,
     last_preview: Instant,
-    fps: (Instant, u64, f64),
+    fps: FpsMeter,
+}
+
+/// Frames received per second, updated once a second.
+struct FpsMeter {
+    since: Instant,
+    frames_then: u64,
+    fps: f64,
 }
 
 fn qr_image(url: &str) -> ColorImage {
@@ -70,9 +77,10 @@ impl Window {
     }
 
     fn update_fps(&mut self, stats: &Stats) {
-        if self.fps.0.elapsed() >= Duration::from_secs(1) {
-            let dt = self.fps.0.elapsed().as_secs_f64();
-            self.fps = (Instant::now(), stats.frames_in, (stats.frames_in - self.fps.1) as f64 / dt);
+        let elapsed = self.fps.since.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let fps = (stats.frames_in - self.fps.frames_then) as f64 / elapsed.as_secs_f64();
+            self.fps = FpsMeter { since: Instant::now(), frames_then: stats.frames_in, fps };
         }
     }
 
@@ -89,10 +97,14 @@ impl Window {
             let image = egui::Image::new(qr).fit_to_exact_size(egui::vec2(220.0, 220.0));
             ui.add(image);
         }
-        egui::ComboBox::from_id_salt("url")
-            .width(300.0)
-            .selected_text(&self.app.urls[self.selected_url])
-            .show_ui(ui, |ui| url_choices(ui, &self.app.urls, &mut self.selected_url));
+        egui::ComboBox::from_id_salt("url").width(300.0).selected_text(&self.app.urls[self.selected_url]).show_ui(
+            ui,
+            |ui| {
+                for (i, url) in self.app.urls.iter().enumerate() {
+                    ui.selectable_value(&mut self.selected_url, i, url);
+                }
+            },
+        );
         if ui.button("Copy URL").clicked() {
             ui.ctx().copy_text(self.app.urls[self.selected_url].clone());
         }
@@ -112,7 +124,7 @@ impl Window {
         }
         let status = if self.app.hub.streaming() {
             let (w, h) = stats.source_size;
-            format!("● Streaming from iPhone ({}) — {w}×{h}, {:.0} fps", stats.transport, self.fps.2)
+            format!("● Streaming from iPhone ({}) — {w}×{h}, {:.0} fps", stats.transport, self.fps.fps)
         } else {
             "○ Waiting for iPhone…".to_string()
         };
@@ -125,12 +137,6 @@ impl Window {
             self.app.settings.fps
         );
         ui.label(RichText::new(camera).weak());
-    }
-}
-
-fn url_choices(ui: &mut egui::Ui, urls: &[String], selected: &mut usize) {
-    for (i, url) in urls.iter().enumerate() {
-        ui.selectable_value(selected, i, url);
     }
 }
 
@@ -161,7 +167,7 @@ pub fn run(app: App) -> anyhow::Result<()> {
         qr: None,
         preview: None,
         last_preview: Instant::now() - Duration::from_secs(1),
-        fps: (Instant::now(), 0, 0.0),
+        fps: FpsMeter { since: Instant::now(), frames_then: 0, fps: 0.0 },
     };
     eframe::run_native("iPhone Webcam", options, Box::new(|_| Ok(Box::new(window))))
         .map_err(|e| anyhow::anyhow!("window: {e}"))

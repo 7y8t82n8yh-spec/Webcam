@@ -104,30 +104,20 @@ fn print_banner(app: &App) {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let filter = if args.verbose { "debug,str0m=info" } else { "info,str0m=warn" };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
     anyhow::ensure!(args.width % 2 == 0 && args.height % 2 == 0, "width and height must be even");
 
-    match args.command {
-        #[cfg(windows)]
-        Some(Cmd::Install { dll }) => {
-            let result = iphone_webcam::install::install(args.port, dll);
-            std::process::exit(pause_on_error(args.elevated, result)?)
+    if let Some(command) = args.command.take() {
+        let result = run_install_command(command, &args);
+        if let (true, Err(err)) = (args.elevated, &result) {
+            // The elevated console window closes on exit; keep the error readable.
+            eprintln!("Error: {err:#}\n\nPress Enter to close this window.");
+            let _ = std::io::stdin().read_line(&mut String::new());
         }
-        #[cfg(windows)]
-        Some(Cmd::Uninstall) => {
-            let result = iphone_webcam::install::uninstall();
-            std::process::exit(pause_on_error(args.elevated, result)?)
-        }
-        #[cfg(target_os = "linux")]
-        Some(Cmd::Install { .. }) => std::process::exit(iphone_webcam::install::install(args.port, &args.camera_name)?),
-        #[cfg(target_os = "linux")]
-        Some(Cmd::Uninstall) => std::process::exit(iphone_webcam::install::uninstall(args.port, &args.camera_name)?),
-        #[cfg(not(any(windows, target_os = "linux")))]
-        Some(_) => anyhow::bail!("install/uninstall are for Windows 11 and Linux"),
-        None => {}
+        std::process::exit(result?);
     }
 
     let settings = Settings {
@@ -156,14 +146,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Keep an elevated console window open long enough to read the error.
-#[cfg(windows)]
-fn pause_on_error(pause: bool, result: Result<i32>) -> Result<i32> {
-    if let (true, Err(err)) = (pause, &result) {
-        eprintln!("Error: {err:#}\n\nPress Enter to close this window.");
-        let _ = std::io::stdin().read_line(&mut String::new());
+/// `install` / `uninstall`; returns the exit code.
+#[cfg(any(windows, target_os = "linux"))]
+fn run_install_command(command: Cmd, args: &Args) -> Result<i32> {
+    use iphone_webcam::install;
+    match command {
+        Cmd::Install { dll } => install::install(args.port, &args.camera_name, dll),
+        Cmd::Uninstall => install::uninstall(args.port, &args.camera_name),
     }
-    result
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn run_install_command(_: Cmd, _: &Args) -> Result<i32> {
+    anyhow::bail!("install/uninstall are for Windows 11 and Linux")
 }
 
 /// Ctrl+C (and console close) -> message on `tx`.
