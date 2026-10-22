@@ -32,7 +32,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-          cargo test --workspace
+          cargo test --workspace --no-fail-fast
 
       - name: Build release
         run: cargo build --release -p iphone-webcam -p vcam -p vcam-probe

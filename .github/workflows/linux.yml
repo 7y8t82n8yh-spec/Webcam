@@ -31,7 +31,7 @@ jobs:
       - name: Tests (OpenH264 decoder, headless Chrome with a fake camera)
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       - name: Build release
         run: cargo build --release -p iphone-webcam

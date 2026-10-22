@@ -38,10 +38,18 @@ async fn launch(t: &common::TestApp) -> Option<(Browser, tokio::task::JoinHandle
         .arg("use-fake-device-for-media-stream")
         .arg("use-fake-ui-for-media-stream")
         .arg("ignore-certificate-errors")
+        .launch_timeout(Duration::from_secs(60))
         .build()
         .unwrap();
+    // One browser at a time: several starting at once time out on small CI machines.
+    static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let turn = ONE_AT_A_TIME.lock().await;
     let (browser, mut handler) = Browser::launch(config).await.expect("launch browser");
-    let task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // The turn ends when the test aborts this task, or its runtime drops it on a panic.
+    let task = tokio::spawn(async move {
+        let _turn = turn;
+        while handler.next().await.is_some() {}
+    });
     Some((browser, task))
 }
 
