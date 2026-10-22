@@ -113,16 +113,15 @@ fn control_message_received(page: &PageRef, pc: &RtcPeerConnection, event: &Mess
     }
 }
 
+/// Give up on `pc` if it hasn't connected in time.
 fn start_connect_timer(page: &PageRef, pc: &RtcPeerConnection, signalling: &AbortController) -> TimerHandle {
     let (page_for_timer, pc, signalling) = (page.clone(), pc.clone(), signalling.clone());
-    set_timeout(&page.window, RTC_CONNECT_TIMEOUT_MS, move || connect_timed_out(&page_for_timer, &pc, &signalling))
-}
-
-fn connect_timed_out(page: &PageRef, pc: &RtcPeerConnection, signalling: &AbortController) {
-    if is_current_pc(page, pc) && pc.connection_state() != RtcPeerConnectionState::Connected {
-        signalling.abort();
-        connection_failed(page, pc);
-    }
+    set_timeout(&page.window, RTC_CONNECT_TIMEOUT_MS, move || {
+        if is_current_pc(&page_for_timer, &pc) && pc.connection_state() != RtcPeerConnectionState::Connected {
+            signalling.abort();
+            connection_failed(&page_for_timer, &pc);
+        }
+    })
 }
 
 fn watch_connection_state(page: &PageRef, pc: &RtcPeerConnection, connect_timer: TimerHandle) {
@@ -147,7 +146,12 @@ fn connection_state_changed(
     }
     match pc.connection_state() {
         RtcPeerConnectionState::Disconnected => {
-            let timer = start_disconnect_grace_timer(page, pc);
+            let (page_for_timer, pc) = (page.clone(), pc.clone());
+            let timer = set_timeout(&page.window, RTC_DISCONNECT_GRACE_MS, move || {
+                if is_current_pc(&page_for_timer, &pc) {
+                    connection_failed(&page_for_timer, &pc);
+                }
+            });
             *disconnect_timer.borrow_mut() = Some(timer);
         }
         RtcPeerConnectionState::Connected => connection_established(page, connect_timer),
@@ -156,17 +160,6 @@ fn connection_state_changed(
             connection_failed(page, pc);
         }
         _ => {}
-    }
-}
-
-fn start_disconnect_grace_timer(page: &PageRef, pc: &RtcPeerConnection) -> TimerHandle {
-    let (page_for_timer, pc) = (page.clone(), pc.clone());
-    set_timeout(&page.window, RTC_DISCONNECT_GRACE_MS, move || disconnect_grace_expired(&page_for_timer, &pc))
-}
-
-fn disconnect_grace_expired(page: &PageRef, pc: &RtcPeerConnection) {
-    if is_current_pc(page, pc) {
-        connection_failed(page, pc);
     }
 }
 

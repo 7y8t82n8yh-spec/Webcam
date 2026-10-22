@@ -58,25 +58,20 @@ async fn wait_for_ice_gathering(page: &Page, pc: &RtcPeerConnection) {
     if pc.ice_gathering_state() == RtcIceGatheringState::Complete {
         return;
     }
-    let mut wait = |resolve: Function, _reject: Function| resolve_when_gathered(page, pc, resolve);
+    // A promise that resolves when gathering completes, or on the timeout.
+    let mut wait = |resolve: Function, _reject: Function| {
+        let resolve_on_timeout = resolve.clone();
+        set_timeout(&page.window, ICE_GATHERING_TIMEOUT_MS, move || {
+            let _ = resolve_on_timeout.call0(&JsValue::NULL);
+        });
+        let watched_pc = pc.clone();
+        let _ = add_listener(pc, "icegatheringstatechange", move || {
+            if watched_pc.ice_gathering_state() == RtcIceGatheringState::Complete {
+                let _ = resolve.call0(&JsValue::NULL);
+            }
+        });
+    };
     let _ = JsFuture::from(Promise::new(&mut wait)).await;
-}
-
-fn resolve_when_gathered(page: &Page, pc: &RtcPeerConnection, resolve: Function) {
-    let resolve_on_timeout = resolve.clone();
-    set_timeout(&page.window, ICE_GATHERING_TIMEOUT_MS, move || resolve_now(&resolve_on_timeout));
-    let watched_pc = pc.clone();
-    let _ = add_listener(pc, "icegatheringstatechange", move || resolve_if_gathered(&watched_pc, &resolve));
-}
-
-fn resolve_if_gathered(pc: &RtcPeerConnection, resolve: &Function) {
-    if pc.ice_gathering_state() == RtcIceGatheringState::Complete {
-        resolve_now(resolve);
-    }
-}
-
-fn resolve_now(resolve: &Function) {
-    let _ = resolve.call0(&JsValue::NULL);
 }
 
 fn stop_after_key_rejected(page: &PageRef, pc: &RtcPeerConnection, connect_timer: TimerHandle) {

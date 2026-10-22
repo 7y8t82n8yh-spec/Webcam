@@ -47,15 +47,12 @@ async fn play_silent_video(page: &PageRef) {
 /// iOS can drop the lock without hiding the page (e.g. after a system alert); take it again.
 fn retake_wake_lock_on_release(page: &PageRef, sentinel: &JsValue) {
     let page = page.clone();
-    let on_release = into_js_function(Closure::<dyn FnMut()>::new(move || wake_lock_released(&page)));
+    let on_release = move || {
+        if page.state.borrow().is_running && !page.is_hidden() {
+            let page_for_retry = page.clone();
+            set_timeout(&page.window, WAKE_LOCK_RETRY_DELAY_MS, move || request_wake_lock(&page_for_retry));
+        }
+    };
+    let on_release = into_js_function(Closure::<dyn FnMut()>::new(on_release));
     let _ = call_method(sentinel, "addEventListener", &["release".into(), on_release.into()]);
-}
-
-fn wake_lock_released(page: &PageRef) {
-    let is_running = page.state.borrow().is_running;
-    if !is_running || page.is_hidden() {
-        return;
-    }
-    let page_for_retry = page.clone();
-    set_timeout(&page.window, WAKE_LOCK_RETRY_DELAY_MS, move || request_wake_lock(&page_for_retry));
 }

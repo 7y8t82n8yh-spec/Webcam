@@ -14,12 +14,6 @@ use crate::page::PageRef;
 use crate::state::Transport;
 
 const STATS_INTERVAL_MS: i32 = 1000;
-const MS_PER_SECOND: f64 = 1000.0;
-/// Guards the rate division against a zero-length interval.
-const MIN_INTERVAL_SECS: f64 = 0.001;
-const BITS_PER_BYTE: f64 = 8.0;
-const BITS_PER_KILOBIT: f64 = 1000.0;
-const KILOBITS_PER_MEGABIT: f64 = 1000.0;
 
 /// The counters at the previous stats tick.
 #[derive(Clone, Copy)]
@@ -30,20 +24,17 @@ struct StatsSample {
 }
 
 pub fn start_stats(page: &PageRef) {
-    let first_sample = StatsSample { time_ms: now_ms(), frames: 0.0, bytes: 0.0 };
-    let previous = Rc::new(Cell::new(first_sample));
+    let previous = Rc::new(Cell::new(StatsSample { time_ms: now_ms(), frames: 0.0, bytes: 0.0 }));
     let page_for_tick = page.clone();
-    let tick = into_js_function(Closure::<dyn FnMut()>::new(move || stats_tick(&page_for_tick, &previous)));
+    let tick = move || {
+        let (page, previous) = (page_for_tick.clone(), previous.clone());
+        spawn_local(async move {
+            read_rtc_counters(&page).await;
+            show_stats(&page, &previous);
+        });
+    };
+    let tick = into_js_function(Closure::<dyn FnMut()>::new(tick));
     let _ = page.window.set_interval_with_callback_and_timeout_and_arguments_0(&tick, STATS_INTERVAL_MS);
-}
-
-fn stats_tick(page: &PageRef, previous: &Rc<Cell<StatsSample>>) {
-    spawn_local(update_stats(page.clone(), previous.clone()));
-}
-
-async fn update_stats(page: PageRef, previous: Rc<Cell<StatsSample>>) {
-    read_rtc_counters(&page).await;
-    show_stats(&page, &previous);
 }
 
 async fn read_rtc_counters(page: &PageRef) {
@@ -85,10 +76,10 @@ fn show_stats(page: &PageRef, previous: &Cell<StatsSample>) {
         StatsSample { time_ms: now_ms(), frames: state.frames_sent, bytes: state.bytes_sent }
     };
     let last = previous.replace(current);
-    let interval_secs = ((current.time_ms - last.time_ms) / MS_PER_SECOND).max(MIN_INTERVAL_SECS);
+    let seconds = ((current.time_ms - last.time_ms) / 1000.0).max(0.001);
     // Counters restart with each new peer connection: never show negative rates.
-    let fps = (current.frames - last.frames).max(0.0) / interval_secs;
-    let kbps = (current.bytes - last.bytes).max(0.0) * BITS_PER_BYTE / BITS_PER_KILOBIT / interval_secs;
+    let fps = (current.frames - last.frames).max(0.0) / seconds;
+    let kbps = (current.bytes - last.bytes).max(0.0) * 8.0 / 1000.0 / seconds;
     let text = stats_text(page, fps, kbps);
     page.element::<HtmlElement>("stats").set_text_content(Some(&text));
 }
@@ -96,10 +87,6 @@ fn show_stats(page: &PageRef, previous: &Cell<StatsSample>) {
 fn stats_text(page: &PageRef, fps: f64, kbps: f64) -> String {
     let (video_width, video_height) = (page.video.video_width(), page.video.video_height());
     let resolution = if video_width > 0 { format!("{video_width}×{video_height} · ") } else { String::new() };
-    let rate = if kbps >= KILOBITS_PER_MEGABIT {
-        format!("{:.1} Mbps", kbps / KILOBITS_PER_MEGABIT)
-    } else {
-        format!("{kbps:.0} kbps")
-    };
+    let rate = if kbps >= 1000.0 { format!("{:.1} Mbps", kbps / 1000.0) } else { format!("{kbps:.0} kbps") };
     format!("{resolution}{fps:.0} fps · {rate}")
 }

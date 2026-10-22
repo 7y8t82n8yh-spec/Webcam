@@ -21,18 +21,25 @@ const STREAMING_OVER_HTTP: &str = "Streaming (HTTP)";
 /// Switch to HTTP POSTs. Without a socket, the config has to be fetched once instead.
 pub fn start(page: &PageRef) {
     page.state.borrow_mut().transport = Transport::Http;
-    spawn_local(fetch_and_apply_config(page.clone()));
+    let page = page.clone();
+    spawn_local(async move {
+        if let Ok(config) = fetch_config(&page).await {
+            apply_config(&page, config);
+        }
+        page.set_status(STREAMING_OVER_HTTP, StatusKind::Good);
+    });
 }
 
 pub fn send_frame(page: &PageRef, blob: Blob) {
-    spawn_local(post_frame_and_report(page.clone(), blob));
-}
-
-async fn fetch_and_apply_config(page: PageRef) {
-    if let Ok(config) = fetch_config(&page).await {
-        apply_config(&page, config);
-    }
-    page.set_status(STREAMING_OVER_HTTP, StatusKind::Good);
+    let page = page.clone();
+    spawn_local(async move {
+        match post_frame(&page, &blob).await {
+            Ok(HTTP_FORBIDDEN) => page.set_status(PAIRING_KEY_REJECTED, StatusKind::Bad),
+            Ok(_) => page.set_status(STREAMING_OVER_HTTP, StatusKind::Good),
+            Err(_) => page.set_status("PC unreachable", StatusKind::Bad),
+        }
+        frame_acknowledged(&page);
+    });
 }
 
 async fn fetch_config(page: &PageRef) -> Result<StreamConfig, JsValue> {
@@ -40,15 +47,6 @@ async fn fetch_config(page: &PageRef) -> Result<StreamConfig, JsValue> {
     let response: Response = JsFuture::from(request).await?.unchecked_into();
     let text = response_text(&response).await?;
     serde_json::from_str(&text).map_err(|error| error.to_string().into())
-}
-
-async fn post_frame_and_report(page: PageRef, blob: Blob) {
-    match post_frame(&page, &blob).await {
-        Ok(HTTP_FORBIDDEN) => page.set_status(PAIRING_KEY_REJECTED, StatusKind::Bad),
-        Ok(_) => page.set_status(STREAMING_OVER_HTTP, StatusKind::Good),
-        Err(_) => page.set_status("PC unreachable", StatusKind::Bad),
-    }
-    frame_acknowledged(&page);
 }
 
 /// POST one JPEG frame; returns the HTTP status.

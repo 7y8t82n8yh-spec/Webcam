@@ -15,8 +15,6 @@ use crate::state::{Facing, VideoSize};
 
 /// Wait this long after the camera track ends before checking whether to reopen it.
 const TRACK_ENDED_RECOVERY_DELAY_MS: i32 = 300;
-/// The `frameRate.max` constraint is never lower than this.
-const MIN_MAX_FRAME_RATE: u32 = 30;
 
 /// Open the camera with the current settings, replacing any camera already open.
 pub async fn open_camera(page: &PageRef) -> Result<(), JsValue> {
@@ -42,7 +40,12 @@ pub async fn open_camera(page: &PageRef) -> Result<(), JsValue> {
 
 /// Reopen the camera in the background, showing any error in the status line.
 pub fn reopen_camera(page: &PageRef) {
-    spawn_local(reopen_camera_reporting_errors(page.clone()));
+    let page = page.clone();
+    spawn_local(async move {
+        if let Err(error) = open_camera(&page).await {
+            page.set_status(&format!("Camera error: {}", error_message(&error)), StatusKind::Bad);
+        }
+    });
 }
 
 /// Reopen the camera if it is no longer delivering frames.
@@ -97,7 +100,7 @@ fn stop_all_tracks(stream: &MediaStream) {
 
 fn camera_constraints(facing: Facing, size: VideoSize, fps: u32) -> Object {
     let ideal = |value: JsValue| js_object(&[("ideal", value)]);
-    let frame_rate = js_object(&[("ideal", fps.into()), ("max", fps.max(MIN_MAX_FRAME_RATE).into())]);
+    let frame_rate = js_object(&[("ideal", fps.into()), ("max", fps.max(30).into())]);
     let video = js_object(&[
         ("facingMode", ideal(facing.as_str().into()).into()),
         ("width", ideal((size.width as f64).into()).into()),
@@ -115,24 +118,15 @@ async fn show_preview(page: &PageRef, stream: &MediaStream) {
     }
 }
 
+/// iOS ends the track when it takes the camera away (e.g. a phone call).
 fn recover_when_track_ends(page: &PageRef, track: &MediaStreamTrack) -> Result<(), JsValue> {
     let page = page.clone();
-    add_listener(track, "ended", move || camera_track_ended(&page))
-}
-
-fn camera_track_ended(page: &PageRef) {
-    if !page.state.borrow().is_running {
-        return;
-    }
-    let page_for_timer = page.clone();
-    set_timeout(&page.window, TRACK_ENDED_RECOVERY_DELAY_MS, move || recover_camera(&page_for_timer));
-}
-
-async fn reopen_camera_reporting_errors(page: PageRef) {
-    if let Err(error) = open_camera(&page).await {
-        let status = format!("Camera error: {}", error_message(&error));
-        page.set_status(&status, StatusKind::Bad);
-    }
+    add_listener(track, "ended", move || {
+        if page.state.borrow().is_running {
+            let page_for_timer = page.clone();
+            set_timeout(&page.window, TRACK_ENDED_RECOVERY_DELAY_MS, move || recover_camera(&page_for_timer));
+        }
+    })
 }
 
 fn is_track_live(track: &MediaStreamTrack) -> bool {

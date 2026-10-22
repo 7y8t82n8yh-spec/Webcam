@@ -63,13 +63,11 @@ fn socket_url(page: &Page) -> String {
 
 fn close_unless_open_in_time(page: &PageRef, socket: &WebSocket) -> TimerHandle {
     let socket = socket.clone();
-    set_timeout(&page.window, SOCKET_OPEN_TIMEOUT_MS, move || close_if_not_open(&socket))
-}
-
-fn close_if_not_open(socket: &WebSocket) {
-    if socket.ready_state() != WebSocket::OPEN {
-        let _ = socket.close();
-    }
+    set_timeout(&page.window, SOCKET_OPEN_TIMEOUT_MS, move || {
+        if socket.ready_state() != WebSocket::OPEN {
+            let _ = socket.close();
+        }
+    })
 }
 
 /// Every handler ignores sockets that have since been superseded by a newer one,
