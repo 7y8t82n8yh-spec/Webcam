@@ -101,8 +101,7 @@ mod tests {
     #[test]
     fn offer_request_flattens_client_info() {
         let req: OfferRequest =
-            serde_json::from_str(r#"{"sdp":"v=0","id":"abc","ua":"Safari","camera":"user","width":1280}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"sdp":"v=0","id":"abc","ua":"Safari","camera":"user","width":1280}"#).unwrap();
         assert_eq!(req.info.ua, "Safari");
         assert_eq!(req.info.height, 0);
     }

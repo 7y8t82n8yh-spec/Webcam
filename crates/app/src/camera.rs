@@ -32,7 +32,12 @@ pub struct OutputThread {
 }
 
 impl OutputThread {
-    pub fn spawn(hub: Arc<FrameHub>, mut sink: Option<Box<dyn CameraSink>>, fps: u32, status: Arc<Mutex<String>>) -> Self {
+    pub fn spawn(
+        hub: Arc<FrameHub>,
+        mut sink: Option<Box<dyn CameraSink>>,
+        fps: u32,
+        status: Arc<Mutex<String>>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);

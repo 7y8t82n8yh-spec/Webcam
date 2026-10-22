@@ -20,7 +20,7 @@ pub struct TestApp {
     pub base: String,
     pub key: String,
     pub client: reqwest::Client,
-    dir: PathBuf,
+    pub dir: PathBuf,
 }
 
 impl Drop for TestApp {
@@ -66,14 +66,7 @@ impl TestApp {
     }
 
     pub async fn status(&self) -> serde_json::Value {
-        self.client
-            .get(format!("{}/status?k={}", self.base, self.key))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
+        self.client.get(format!("{}/status?k={}", self.base, self.key)).send().await.unwrap().json().await.unwrap()
     }
 
     /// Wait until `frames_in` reaches `count`; returns the last status.

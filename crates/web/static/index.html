@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>iPhone Webcam</title>
+<style>
+  :root { color-scheme: dark; --accent: #0a84ff; --bad: #ff453a; --ok: #30d158; --muted: #8e8e93; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow: hidden; }
+  #preview { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #preview.mirror { transform: scaleX(-1); }
+  #dim { position: fixed; inset: 0; background: #000; display: none; z-index: 5; }
+  #dim.on { display: block; }
+  #dim p { position: absolute; bottom: 40px; width: 100%; text-align: center; color: #333; font-size: 14px; }
+  .bar { position: fixed; left: 0; right: 0; z-index: 10; display: flex; gap: 8px; align-items: center;
+    padding: 12px max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left)); }
+  #top { top: 0; padding-top: max(12px, env(safe-area-inset-top));
+    background: linear-gradient(#000c, #0000); justify-content: space-between; font-size: 13px; }
+  #bottom { bottom: 0; padding-bottom: max(16px, env(safe-area-inset-bottom));
+    background: linear-gradient(#0000, #000c); justify-content: center; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--muted);
+    margin-right: 6px; vertical-align: 1px; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  #stats { color: #ccc; font-variant-numeric: tabular-nums; text-align: right; }
+  button, select { font: inherit; color: #fff; background: #ffffff26; border: 0; border-radius: 22px;
+    padding: 10px 16px; min-height: 44px; -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+  button:active { background: #ffffff44; }
+  select { appearance: none; -webkit-appearance: none; padding-right: 16px; }
+  #start-screen { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px; padding: 24px; text-align: center; background: #000; }
+  #start-screen h1 { margin: 0; font-size: 26px; }
+  #start-screen p { margin: 0; color: var(--muted); max-width: 340px; }
+  #start { background: var(--accent); font-size: 19px; font-weight: 600; padding: 16px 40px; border-radius: 30px; }
+  #error { color: var(--bad); white-space: pre-wrap; }
+  .hidden { display: none !important; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <video id="preview" playsinline autoplay muted></video>
+  <!-- Kept off-screen rather than display:none, which iOS may refuse to play. -->
+  <video id="nosleep" playsinline muted loop style="position:absolute;left:-100%;top:-100%;width:1px;height:1px"></video>
+  <div id="dim"><p>Screen dimmed &mdash; still streaming. Tap to wake.</p></div>
+
+  <div id="top" class="bar hidden">
+    <div><span id="dot" class="dot"></span><span id="state">Connecting…</span></div>
+    <div id="stats"></div>
+  </div>
+
+  <div id="bottom" class="bar hidden">
+    <button id="flip" title="Switch camera">Flip</button>
+    <select id="quality" title="Resolution">
+      <option value="640x360">360p</option>
+      <option value="1280x720" selected>720p</option>
+      <option value="1920x1080">1080p</option>
+    </select>
+    <button id="mirror" title="Mirror preview">Mirror</button>
+    <button id="dimbtn" title="Black out the screen to save battery">Dim</button>
+  </div>
+
+  <div id="start-screen">
+    <h1>iPhone Webcam</h1>
+    <p>Streams this phone's camera to your PC's virtual webcam. Keep this page open in the foreground while streaming.</p>
+    <button id="start">Start camera</button>
+    <p id="error"></p>
+    <p style="font-size:13px">Tired of the certificate warning? <a href="/ca.crt">Install the local certificate</a>
+      install it under Settings › General › VPN &amp; Device Management, then enable it under
+      Settings › General › About › Certificate Trust Settings.</p>
+  </div>
+
+  <script type="module">
+    import init from "/pkg/web.js";
+    init({ module_or_path: "/pkg/web_bg.wasm" });
+  </script>
+</body>
+</html>

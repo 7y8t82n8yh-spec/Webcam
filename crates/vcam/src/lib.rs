@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! iPhone Webcam's Windows 11 virtual camera.
+//!
+//! This DLL is a COM server providing a Media Foundation media source. The app creates
+//! a camera with `MFCreateVirtualCamera` pointing at our CLSID; the Windows Camera
+//! Frame Server service then loads this DLL and asks it for frames, which come from
+//! the shared section the app writes (see `protocol::frame_section`).
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#![allow(non_snake_case)] // COM method names
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod convert;
+
+#[cfg(windows)]
+mod imp;

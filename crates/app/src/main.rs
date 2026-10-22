@@ -1,11 +1,10 @@
 //! iPhone Webcam: use an iPhone as a webcam on a Windows 11 PC.
 
-
 use std::net::IpAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use iphone_webcam::app::{App, Settings};
 use iphone_webcam::hub::FitMode;
@@ -13,6 +12,8 @@ use iphone_webcam::hub::FitMode;
 #[derive(Parser)]
 #[command(name = "iphone-webcam", version, about = "Use an iPhone as a webcam for this PC")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Cmd>,
     /// HTTPS port the phone connects to.
     #[arg(long, default_value_t = 8443)]
     port: u16,
@@ -53,6 +54,18 @@ struct Args {
     verbose: bool,
 }
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Register the virtual camera and open the firewall (asks for administrator rights).
+    Install {
+        /// Path to iPhoneWebcamVCam.dll (default: next to this program).
+        #[arg(long)]
+        dll: Option<PathBuf>,
+    },
+    /// Remove the virtual camera and firewall rules.
+    Uninstall,
+}
+
 fn default_data_dir() -> PathBuf {
     match std::env::var_os("APPDATA") {
         Some(appdata) => PathBuf::from(appdata).join("iPhoneWebcam"),
@@ -76,7 +89,7 @@ fn print_banner(app: &App) {
         println!("\n{art}");
     }
     println!("Safari warns about the certificate the first time: tap 'Show Details' > 'visit this website'.");
-    println!("Press Ctrl+C to quit.\n");
+    println!("Close the window or press Ctrl+C to quit.\n");
 }
 
 fn main() -> Result<()> {
@@ -86,6 +99,16 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
         .init();
     anyhow::ensure!(args.width % 2 == 0 && args.height % 2 == 0, "width and height must be even");
+
+    match args.command {
+        #[cfg(windows)]
+        Some(Cmd::Install { dll }) => std::process::exit(iphone_webcam::install::install(args.port, dll)?),
+        #[cfg(windows)]
+        Some(Cmd::Uninstall) => std::process::exit(iphone_webcam::install::uninstall()?),
+        #[cfg(not(windows))]
+        Some(_) => anyhow::bail!("install/uninstall are for Windows 11"),
+        None => {}
+    }
 
     let settings = Settings {
         host: args.host,
@@ -102,6 +125,9 @@ fn main() -> Result<()> {
     };
     let mut app = App::start(settings)?;
     print_banner(&app);
+    if !args.no_gui {
+        return iphone_webcam::gui::run(app);
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     ctrlc_channel(tx);

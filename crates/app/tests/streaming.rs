@@ -66,7 +66,8 @@ async fn jpeg_frames_over_websocket_with_acks() {
         .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
         .with_no_client_auth();
     let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls));
-    let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector)).await.unwrap();
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector)).await.unwrap();
 
     let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
     assert!(first.contains(r#""type":"config""#), "{first}");

@@ -32,3 +32,8 @@ pub const HEADER_SIZE: usize = 64;
 pub const SECTION_SIZE: usize = HEADER_SIZE + (MAX_WIDTH as usize) * (MAX_HEIGHT as usize) * 3;
 
 const _: () = assert!(core::mem::size_of::<Header>() == HEADER_SIZE);
+
+/// COM class of the camera's media source (crates/vcam). The app passes it to
+/// `MFCreateVirtualCamera`; the installer registers it.
+pub const VCAM_CLSID: &str = "{8E3B5C1A-6F42-4D8B-9C77-2A1D5E0F4B93}";
+pub const VCAM_CLSID_U128: u128 = 0x8E3B5C1A_6F42_4D8B_9C77_2A1D5E0F4B93;

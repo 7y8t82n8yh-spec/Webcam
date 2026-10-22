@@ -11,6 +11,7 @@ axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 epaint_default_fonts = "0.37.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 if-addrs = "0.15.0"
@@ -31,6 +32,7 @@ x509-parser = "0.18.1"
 zune-jpeg = "0.5.15"
 
 [dev-dependencies]
+chromiumoxide = { version = "0.9.1", default-features = false }
 jpeg-encoder = "0.7.1"
 openh264 = "0.9.9"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
@@ -44,6 +46,22 @@ openh264 = ["dep:openh264"]
 # WebRTC crypto: Windows' own (CNG) on Windows, pure Rust elsewhere.
 [target.'cfg(windows)'.dependencies]
 str0m = { version = "0.24.1", default-features = false, features = ["wincrypto"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(not(windows))'.dependencies]
 str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }

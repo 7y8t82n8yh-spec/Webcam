@@ -125,8 +125,7 @@ pub fn ensure(dir: &Path, ips: &[IpAddr]) -> Result<Certificates> {
 
     let meta_path = dir.join("server.json");
     let now = OffsetDateTime::now_utc();
-    let current: Option<ServerMeta> =
-        fs::read(&meta_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let current: Option<ServerMeta> = fs::read(&meta_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let reuse = current.is_some_and(|m| {
         m.ca_sha256 == sha256_hex(&ca_der)
             && hosts.iter().all(|h| m.hosts.contains(h))
@@ -218,4 +217,3 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 }
-

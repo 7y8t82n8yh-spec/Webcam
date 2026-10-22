@@ -134,9 +134,12 @@ impl Server {
             .route_layer(middleware::from_fn_with_state(self.clone(), check_key));
         Router::new()
             .route("/", get(|| async { web_assets::serve("index.html") }))
-            .route("/pkg/{file}", get(|axum::extract::Path(file): axum::extract::Path<String>| async move {
-                web_assets::serve(&format!("pkg/{file}"))
-            }))
+            .route(
+                "/pkg/{file}",
+                get(|axum::extract::Path(file): axum::extract::Path<String>| async move {
+                    web_assets::serve(&format!("pkg/{file}"))
+                }),
+            )
             .route("/config", get(config))
             .route("/ca.crt", get(ca_cert))
             .merge(protected)
@@ -148,13 +151,9 @@ impl Server {
 /// Endpoints that carry camera images need the pairing key from the QR code, so other
 /// devices on the network can neither watch nor inject video.
 async fn check_key(State(server): State<Arc<Server>>, request: Request, next: Next) -> Response {
-    let from_query = request
-        .uri()
-        .query()
-        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("k=")))
-        .map(|k| k.to_string());
-    let from_header =
-        request.headers().get(protocol::KEY_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let from_query =
+        request.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("k="))).map(|k| k.to_string());
+    let from_header = request.headers().get(protocol::KEY_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
     let given = from_query.or(from_header).unwrap_or_default();
     if !constant_time_eq(given.as_bytes(), server.key.as_bytes()) {
         return (StatusCode::FORBIDDEN, "missing or wrong pairing key - scan the QR code again").into_response();
