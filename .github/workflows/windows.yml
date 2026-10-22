@@ -6,81 +6,53 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-and-build:
-    runs-on: windows-latest
+  windows11:
+    runs-on: windows-2025
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v6
-
-      - name: Install dependencies
-        run: |
-          uv sync --locked
-          uv run playwright install chromium
-
-      - name: Unit and browser tests
-        run: uv run pytest -v
-
-      - name: Build Windows 11 virtual camera
-        shell: pwsh
-        run: ./scripts/build_vcam.ps1
-
-      - name: Install Unity Capture driver (Windows 10 path)
-        shell: pwsh
-        run: ./scripts/install_driver.ps1 -Legacy -NoPause
-
-      - name: Unity Capture camera end-to-end (read via DirectShow)
-        run: uv run --with imageio-ffmpeg python tests/windows_smoke.py --reader dshow
-
-      - name: Build exe
-        shell: pwsh
-        run: |
-          ./scripts/build_exe.ps1
-          Copy-Item build-vcam/Release/iPhoneWebcamVCam.dll .
-
-      - uses: actions/upload-artifact@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          name: iPhoneWebcam-windows
-          path: |
-            dist/iPhoneWebcam.exe
-            iPhoneWebcamVCam.dll
-            install_driver.bat
-            uninstall_driver.bat
-            scripts/install_driver.ps1
+          targets: wasm32-unknown-unknown
+          components: rustfmt
 
-  windows11-camera:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: astral-sh/setup-uv@v6
+      - name: Formatting
+        run: cargo fmt --all --check
 
-      - name: Install dependencies
-        run: uv sync --locked
+      - name: Build the phone page (Rust → WebAssembly)
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          cargo xtask web
 
-      - name: Build Windows 11 virtual camera
+      - name: Tests (Media Foundation decoder, headless Chrome with a fake camera)
         shell: pwsh
-        run: ./scripts/build_vcam.ps1
+        run: |
+          $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          cargo test --workspace --features iphone-webcam/openh264
 
-      - name: Install it
-        shell: pwsh
-        run: ./scripts/install_driver.ps1 -NoPause
+      - name: Build release
+        run: cargo build --release -p iphone-webcam -p vcam -p vcam-probe
+
+      - name: Install the virtual camera
+        run: target\release\iphone-webcam.exe install --dll target\release\iPhoneWebcamVCam.dll
 
       - name: Camera service and privacy settings
         shell: pwsh
         run: |
           [Environment]::OSVersion | Format-List
-          Get-Service FrameServer, FrameServerMonitor -ErrorAction Continue | Format-Table Name, Status, StartType
           # A fresh runner has never been asked for camera consent; allow it the way a user
           # would under Settings > Privacy & security > Camera.
           foreach ($root in "HKLM:", "HKCU:") {
             $store = "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"
-            Write-Host "$store before: $((Get-ItemProperty $store -ErrorAction SilentlyContinue).Value)"
             New-Item -Path "$store\NonPackaged" -Force | Out-Null
             Set-ItemProperty -Path $store -Name Value -Value Allow
             Set-ItemProperty -Path "$store\NonPackaged" -Name Value -Value Allow
           }
-          # Turn on the media source's diagnostic log (see VLog in vcam.cpp).
+          # Turn on the media source's diagnostic log.
           New-Item -Path HKLM:\SOFTWARE\iPhoneWebcam -Force | Out-Null
           Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLog -Value 1 -Type DWord
           New-Item -ItemType Directory -Force C:\vcamlogs | Out-Null
@@ -88,10 +60,13 @@ jobs:
           Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLogDir -Value C:\vcamlogs
           Set-Service FrameServer -StartupType Manual -ErrorAction Continue
           Start-Service FrameServer -ErrorAction Continue
-          Get-Service FrameServer -ErrorAction Continue | Format-Table Name, Status
+          Get-Service FrameServer, FrameServerMonitor -ErrorAction Continue | Format-Table Name, Status
 
-      - name: Media Foundation camera end-to-end (read via Media Foundation)
-        run: uv run python tests/windows_smoke.py --reader mf --probe build-vcam/Release/vcam_probe.exe
+      - name: Phone → WebRTC → virtual camera → Media Foundation app
+        shell: pwsh
+        run: |
+          $env:VCAM_PROBE = "$PWD\target\release\vcam-probe.exe"
+          cargo test -p iphone-webcam --features openh264 --test windows_camera -- --nocapture
 
       - name: Virtual camera diagnostics
         if: always()
@@ -100,18 +75,21 @@ jobs:
           foreach ($log in Get-ChildItem C:\vcamlogs -Filter "*.log" -ErrorAction SilentlyContinue) {
             Write-Host "===== $($log.FullName)"; Get-Content $log.FullName
           }
-          $crashes = Get-WinEvent -FilterHashtable @{LogName = "Application"; Id = 1000; StartTime = (Get-Date).AddMinutes(-15)} `
-            -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "iPhoneWebcamVCam" }
-          $crashes | Format-List TimeCreated, Message
-          # Turn each crash offset into the function it falls in, using the linker map.
-          foreach ($crash in $crashes) {
-            if ($crash.Message -match "Fault offset: 0x([0-9a-fA-F]+)") {
-              uv run python tests/map_lookup.py build-vcam/Release/iPhoneWebcamVCam.map $Matches[1]
-            }
-          }
+          Get-WinEvent -FilterHashtable @{LogName = "Application"; Id = 1000; StartTime = (Get-Date).AddMinutes(-30)} `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "iPhoneWebcam" } |
+            Format-List TimeCreated, Message
 
-      - name: Is it visible to DirectShow apps too? (informational)
-        if: always()
+      - name: Uninstall
         shell: pwsh
         run: |
-          uv run --with imageio-ffmpeg python -c "import imageio_ffmpeg, subprocess; print(subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], capture_output=True, text=True).stderr)"
+          target\release\iphone-webcam.exe uninstall
+          # The file itself may linger while the camera service still has it loaded.
+          if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{8E3B5C1A-6F42-4D8B-9C77-2A1D5E0F4B93}") { throw "still registered" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneWebcam-windows11
+          path: |
+            target/release/iphone-webcam.exe
+            target/release/iPhoneWebcamVCam.dll
+            target/release/vcam-probe.exe

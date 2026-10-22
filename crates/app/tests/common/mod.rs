@@ -31,6 +31,11 @@ impl Drop for TestApp {
 }
 
 pub fn start() -> TestApp {
+    start_with(false)
+}
+
+/// Start the app, optionally with the real Windows 11 virtual camera.
+pub fn start_with(camera: bool) -> TestApp {
     let dir = std::env::temp_dir().join(format!("iphone-webcam-it-{}", rand::random::<u64>()));
     let app = App::start(Settings {
         host: "127.0.0.1".parse().unwrap(),
@@ -41,7 +46,7 @@ pub fn start() -> TestApp {
         quality: 0.75,
         bitrate_mbps: 6.0,
         mode: FitMode::Fit,
-        camera: false,
+        camera,
         camera_name: "iPhone Webcam".into(),
         data_dir: dir.clone(),
     })
