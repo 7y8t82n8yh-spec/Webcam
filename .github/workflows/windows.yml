@@ -1,0 +1,117 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked
+          uv run playwright install chromium
+
+      - name: Unit and browser tests
+        run: uv run pytest -v
+
+      - name: Build Windows 11 virtual camera
+        shell: pwsh
+        run: ./scripts/build_vcam.ps1
+
+      - name: Install Unity Capture driver (Windows 10 path)
+        shell: pwsh
+        run: ./scripts/install_driver.ps1 -Legacy -NoPause
+
+      - name: Unity Capture camera end-to-end (read via DirectShow)
+        run: uv run --with imageio-ffmpeg python tests/windows_smoke.py --reader dshow
+
+      - name: Build exe
+        shell: pwsh
+        run: |
+          ./scripts/build_exe.ps1
+          Copy-Item build-vcam/Release/iPhoneWebcamVCam.dll .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneWebcam-windows
+          path: |
+            dist/iPhoneWebcam.exe
+            iPhoneWebcamVCam.dll
+            install_driver.bat
+            uninstall_driver.bat
+            scripts/install_driver.ps1
+
+  windows11-camera:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Build Windows 11 virtual camera
+        shell: pwsh
+        run: ./scripts/build_vcam.ps1
+
+      - name: Install it
+        shell: pwsh
+        run: ./scripts/install_driver.ps1 -NoPause
+
+      - name: Camera service and privacy settings
+        shell: pwsh
+        run: |
+          [Environment]::OSVersion | Format-List
+          Get-Service FrameServer, FrameServerMonitor -ErrorAction Continue | Format-Table Name, Status, StartType
+          # A fresh runner has never been asked for camera consent; allow it the way a user
+          # would under Settings > Privacy & security > Camera.
+          foreach ($root in "HKLM:", "HKCU:") {
+            $store = "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"
+            Write-Host "$store before: $((Get-ItemProperty $store -ErrorAction SilentlyContinue).Value)"
+            New-Item -Path "$store\NonPackaged" -Force | Out-Null
+            Set-ItemProperty -Path $store -Name Value -Value Allow
+            Set-ItemProperty -Path "$store\NonPackaged" -Name Value -Value Allow
+          }
+          # Turn on the media source's diagnostic log (see VLog in vcam.cpp).
+          New-Item -Path HKLM:\SOFTWARE\iPhoneWebcam -Force | Out-Null
+          Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLog -Value 1 -Type DWord
+          New-Item -ItemType Directory -Force C:\vcamlogs | Out-Null
+          icacls C:\vcamlogs /grant "*S-1-1-0:(OI)(CI)F" | Out-Null  # Everyone, so the service can write
+          Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLogDir -Value C:\vcamlogs
+          Set-Service FrameServer -StartupType Manual -ErrorAction Continue
+          Start-Service FrameServer -ErrorAction Continue
+          Get-Service FrameServer -ErrorAction Continue | Format-Table Name, Status
+
+      - name: Media Foundation camera end-to-end (read via Media Foundation)
+        run: uv run python tests/windows_smoke.py --reader mf --probe build-vcam/Release/vcam_probe.exe
+
+      - name: Virtual camera diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($log in Get-ChildItem C:\vcamlogs -Filter "*.log" -ErrorAction SilentlyContinue) {
+            Write-Host "===== $($log.FullName)"; Get-Content $log.FullName
+          }
+          $crashes = Get-WinEvent -FilterHashtable @{LogName = "Application"; Id = 1000; StartTime = (Get-Date).AddMinutes(-15)} `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "iPhoneWebcamVCam" }
+          $crashes | Format-List TimeCreated, Message
+          # Turn each crash offset into the function it falls in, using the linker map.
+          foreach ($crash in $crashes) {
+            if ($crash.Message -match "Fault offset: 0x([0-9a-fA-F]+)") {
+              uv run python tests/map_lookup.py build-vcam/Release/iPhoneWebcamVCam.map $Matches[1]
+            }
+          }
+
+      - name: Is it visible to DirectShow apps too? (informational)
+        if: always()
+        shell: pwsh
+        run: |
+          uv run --with imageio-ffmpeg python -c "import imageio_ffmpeg, subprocess; print(subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], capture_output=True, text=True).stderr)"

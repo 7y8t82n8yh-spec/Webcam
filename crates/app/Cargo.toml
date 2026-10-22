@@ -1,0 +1,49 @@
+[package]
+name = "iphone-webcam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ab_glyph = "0.2.32"
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+epaint_default_fonts = "0.37.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
+if-addrs = "0.15.0"
+openh264 = { version = "0.9.9", optional = true }
+protocol = { version = "0.2.0", path = "../protocol" }
+qrcode = "0.14.1"
+rand = "0.10.3"
+rcgen = { version = "0.14.10", features = ["x509-parser", "pem"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+time = "0.3.55"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+x509-parser = "0.18.1"
+zune-jpeg = "0.5.15"
+
+[dev-dependencies]
+jpeg-encoder = "0.7.1"
+openh264 = "0.9.9"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+
+[features]
+openh264 = ["dep:openh264"]
+
+# WebRTC crypto: Windows' own (CNG) on Windows, pure Rust elsewhere.
+[target.'cfg(windows)'.dependencies]
+str0m = { version = "0.24.1", default-features = false, features = ["wincrypto"] }
+
+[target.'cfg(not(windows))'.dependencies]
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }

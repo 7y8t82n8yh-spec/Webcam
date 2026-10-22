@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+*.egg-info/
+.pytest_cache/
+build-vcam/
+/iPhoneWebcamVCam.dll
+target/
