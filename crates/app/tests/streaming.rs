@@ -84,15 +84,19 @@ async fn jpeg_frames_over_websocket_with_acks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn webrtc_h264_stream_reaches_the_camera_output() {
     let t = start();
-    let report = webrtc_phone(&t.target(), "phone-rtc", [220, 120, 40], 3.0).await;
-    assert!(report.connected, "ICE/DTLS connected");
-    assert!(report.frames_sent > 30);
+    let target = t.target();
+    // Check while the phone still streams: once it stops, the output turns to the
+    // "waiting" image after a few seconds.
+    let phone = tokio::spawn(async move { webrtc_phone(&target, "phone-rtc", [220, 120, 40], 6.0).await });
     let status = t.wait_for_frames(20, Duration::from_secs(5)).await;
     assert_eq!(status["transport"], "WebRTC", "{status}");
     assert_eq!(status["sourceSize"], serde_json::json!([640, 360]));
     assert_eq!(status["decodeErrors"], 0);
     // 640x360 scaled into 1280x720 fills the frame; H.264 is lossy, allow some error.
     assert!(close_to(t.output_color(), [220, 120, 40], 12.0), "{:?}", t.output_color());
+    let report = phone.await.unwrap();
+    assert!(report.connected, "ICE/DTLS connected");
+    assert!(report.frames_sent > 30);
 }
 
 #[tokio::test(flavor = "multi_thread")]
