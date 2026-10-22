@@ -114,33 +114,45 @@ impl MfH264Decoder {
 
     unsafe fn emit(&self, sample: &IMFSample, out: &mut dyn FnMut(&Yuv420)) -> Result<()> {
         let buffer = sample.GetBufferByIndex(0)?;
-        let (w, h) = self.visible;
-        let (_, alloc_h) = self.allocated;
-        // Prefer the 2D view, which knows the real row pitch.
-        if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer>() {
+        // Prefer the 2D view, which knows the real row pitch, and ask for the buffer's
+        // length too: every read below is checked against it.
+        if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
             let mut scanline0 = std::ptr::null_mut();
             let mut pitch = 0i32;
-            buffer2d.Lock2D(&mut scanline0, &mut pitch)?;
-            let pitch = pitch.unsigned_abs() as usize;
-            let len = pitch * alloc_h as usize * 3 / 2;
-            let data = std::slice::from_raw_parts(scanline0, len);
-            let (y, uv) = data.split_at(pitch * alloc_h as usize);
-            out(&Yuv420 { width: w, height: h, y, y_stride: pitch, u: uv, v: &[], uv_stride: pitch, nv12: true });
+            let mut start = std::ptr::null_mut();
+            let mut length = 0u32;
+            buffer2d.Lock2DSize(MF2DBuffer_LockFlags_Read, &mut scanline0, &mut pitch, &mut start, &mut length)?;
+            let offset = scanline0.offset_from(start).max(0) as usize;
+            let available = (length as usize).saturating_sub(offset);
+            if pitch > 0 {
+                let data = std::slice::from_raw_parts(scanline0, available);
+                self.emit_nv12(data, pitch as usize, out);
+            }
             buffer2d.Unlock2D()?;
         } else {
-            let mut ptr = std::ptr::null_mut();
-            let mut len = 0u32;
-            buffer.Lock(&mut ptr, None, Some(&mut len))?;
-            let data = std::slice::from_raw_parts(ptr, len as usize);
-            let pitch = self.allocated.0 as usize;
-            let luma = pitch * alloc_h as usize;
-            if data.len() >= luma * 3 / 2 {
-                let (y, uv) = data.split_at(luma);
-                out(&Yuv420 { width: w, height: h, y, y_stride: pitch, u: uv, v: &[], uv_stride: pitch, nv12: true });
-            }
+            let mut pointer = std::ptr::null_mut();
+            let mut length = 0u32;
+            buffer.Lock(&mut pointer, None, Some(&mut length))?;
+            let data = std::slice::from_raw_parts(pointer, length as usize);
+            self.emit_nv12(data, self.allocated.0 as usize, out);
             buffer.Unlock()?;
         }
         Ok(())
+    }
+
+    /// Hand on an NV12 picture, unless `data` is too small for the size we expect (e.g.
+    /// a picture from before a resolution change we haven't seen yet).
+    fn emit_nv12(&self, data: &[u8], pitch: usize, out: &mut dyn FnMut(&Yuv420)) {
+        let (width, height) = self.visible;
+        let allocated_height = self.allocated.1 as usize;
+        let luma_bytes = pitch * allocated_height;
+        let fits = data.len() >= luma_bytes * 3 / 2 && width as usize <= pitch && height as usize <= allocated_height;
+        if !fits {
+            tracing::warn!("skipping a decoded picture that doesn't match {width}x{height} (pitch {pitch})");
+            return;
+        }
+        let (y, uv) = data.split_at(luma_bytes);
+        out(&Yuv420 { width, height, y, y_stride: pitch, u: uv, v: &[], uv_stride: pitch, nv12: true });
     }
 }
 
