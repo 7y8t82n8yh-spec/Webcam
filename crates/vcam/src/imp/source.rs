@@ -155,12 +155,12 @@ fn worker(shared: Arc<Shared>) {
         let Some((token, descriptor)) = next_request(&shared) else { return };
         pace(&mut due);
 
-        let sample = descriptor.ok_or_else(shutdown_error).and_then(|d| unsafe { create_sample(&d, &mut reader) });
-        let sample = sample.and_then(|s| unsafe { attach_token(s, token.as_ref()) });
+        let Some(descriptor) = descriptor else { return };
+        // SAFETY: Media Foundation calls on valid objects.
+        let sample = unsafe { create_sample(&descriptor, token.as_ref(), &mut reader) };
         if logged < 3 || sample.is_err() {
             logged += 1;
-            let outcome = sample.as_ref().map(|_| ()).map_err(|e| e.code());
-            vlog!("stream sample: {:?}", outcome);
+            vlog!("stream sample: {:?}", sample.as_ref().map(|_| ()).map_err(|e| e.code()));
         }
         deliver(&shared, sample);
     }
@@ -189,13 +189,6 @@ fn pace(due: &mut i64) {
     *due = (*due).max(now) + FRAME_DURATION;
 }
 
-unsafe fn attach_token(sample: IMFSample, token: Option<&IUnknown>) -> windows::core::Result<IMFSample> {
-    if let Some(token) = token {
-        sample.SetUnknown(&MFSampleExtension_Token, token)?;
-    }
-    Ok(sample)
-}
-
 /// Queue the sample (or the error making it) if the stream is still running.
 fn deliver(shared: &Shared, sample: windows::core::Result<IMFSample>) {
     let inner = lock(&shared.inner);
@@ -212,8 +205,11 @@ fn deliver(shared: &Shared, sample: windows::core::Result<IMFSample>) {
     }
 }
 
+/// The next frame, converted to the stream's current format, carrying the request's
+/// token (the client matches samples to requests by it).
 unsafe fn create_sample(
     descriptor: &IMFStreamDescriptor,
+    token: Option<&IUnknown>,
     reader: &mut FrameReader,
 ) -> windows::core::Result<IMFSample> {
     let media_type = descriptor.GetMediaTypeHandler()?.GetCurrentMediaType()?;
@@ -239,6 +235,9 @@ unsafe fn create_sample(
     sample.AddBuffer(&buffer)?;
     sample.SetSampleTime(MFGetSystemTime())?;
     sample.SetSampleDuration(FRAME_DURATION)?;
+    if let Some(token) = token {
+        sample.SetUnknown(&MFSampleExtension_Token, token)?;
+    }
     Ok(sample)
 }
 
