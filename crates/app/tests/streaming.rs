@@ -44,7 +44,8 @@ async fn jpeg_frames_over_https_post() {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ok"], true);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["ok"], true);
     }
     let status = t.status().await;
     assert_eq!(status["framesIn"], 5);
@@ -61,24 +62,21 @@ async fn jpeg_frames_over_https_post() {
 async fn jpeg_frames_over_websocket_with_acks() {
     let t = start();
     let url = format!("{}/ws?id=phone-ws&k={}", t.base.replace("https", "wss"), t.key);
-    let tls = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
-        .with_no_client_auth();
-    let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls));
+    let connector = trust_any_certificate();
     let (mut ws, _) =
         tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector)).await.unwrap();
 
-    let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
+    let first = next_text(&mut ws).await;
     assert!(first.contains(r#""type":"config""#), "{first}");
     let jpeg = solid_jpeg(1280, 720, [220, 120, 40]);
     for _ in 0..3 {
         ws.send(tokio_tungstenite::tungstenite::Message::Binary(jpeg.clone().into())).await.unwrap();
-        assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), protocol::ACK);
+        assert_eq!(next_text(&mut ws).await, protocol::ACK);
     }
     ws.send(tokio_tungstenite::tungstenite::Message::Binary(b"garbage".to_vec().into())).await.unwrap();
-    assert_eq!(ws.next().await.unwrap().unwrap().into_text().unwrap(), protocol::BAD);
-    assert!(close_to(t.output_color(), [220, 120, 40], 8.0), "{:?}", t.output_color());
+    assert_eq!(next_text(&mut ws).await, protocol::BAD);
+    let color = t.output_color();
+    assert!(close_to(color, [220, 120, 40], 8.0), "{color:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -93,7 +91,8 @@ async fn webrtc_h264_stream_reaches_the_camera_output() {
     assert_eq!(status["sourceSize"], serde_json::json!([640, 360]));
     assert_eq!(status["decodeErrors"], 0);
     // 640x360 scaled into 1280x720 fills the frame; H.264 is lossy, allow some error.
-    assert!(close_to(t.output_color(), [220, 120, 40], 12.0), "{:?}", t.output_color());
+    let color = t.output_color();
+    assert!(close_to(color, [220, 120, 40], 12.0), "{color:?}");
     let report = phone.await.unwrap();
     assert!(report.connected, "ICE/DTLS connected");
     assert!(report.frames_sent > 30);
@@ -113,7 +112,25 @@ async fn second_phone_takes_over_and_first_is_told() {
         "first phone got {:?}",
         first.control_messages
     );
-    assert!(close_to(t.output_color(), [200, 10, 10], 15.0), "{:?}", t.output_color());
+    let color = t.output_color();
+    assert!(close_to(color, [200, 10, 10], 15.0), "{color:?}");
+}
+
+type WebSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The next message, which must be text.
+async fn next_text(ws: &mut WebSocket) -> tokio_tungstenite::tungstenite::Utf8Bytes {
+    let message = ws.next().await.unwrap().unwrap();
+    message.into_text().unwrap()
+}
+
+/// TLS that accepts the app's self-signed certificate.
+fn trust_any_certificate() -> tokio_tungstenite::Connector {
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+        .with_no_client_auth();
+    tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls))
 }
 
 #[derive(Debug)]

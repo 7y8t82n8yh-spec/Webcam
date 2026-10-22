@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::handler::Handler;
 use futures_util::StreamExt;
 
 /// Init scripts that take transports away, to exercise the page's fallbacks.
@@ -44,17 +45,21 @@ async fn launch(t: &common::TestApp) -> Option<(Browser, tokio::task::JoinHandle
     // One browser at a time: several starting at once time out on small CI machines.
     static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let turn = ONE_AT_A_TIME.lock().await;
-    let (browser, mut handler) = Browser::launch(config).await.expect("launch browser");
+    let (browser, handler) = Browser::launch(config).await.expect("launch browser");
     // The turn ends when the test aborts this task, or its runtime drops it on a panic.
-    let task = tokio::spawn(async move {
-        let _turn = turn;
-        while handler.next().await.is_some() {}
-    });
+    let task = tokio::spawn(drive(handler, turn));
     Some((browser, task))
 }
 
+/// Run the browser's event loop, holding the turn until the task ends.
+async fn drive(mut handler: Handler, turn: tokio::sync::MutexGuard<'static, ()>) {
+    let _turn = turn;
+    while handler.next().await.is_some() {}
+}
+
 async fn page_built(t: &common::TestApp) -> bool {
-    let wasm = t.client.get(format!("{}/pkg/web_bg.wasm", t.base)).send().await.unwrap().bytes().await.unwrap();
+    let response = t.client.get(format!("{}/pkg/web_bg.wasm", t.base)).send().await.unwrap();
+    let wasm = response.bytes().await.unwrap();
     if wasm.is_empty() {
         eprintln!("skipping: phone page not built (run `cargo xtask web`)");
     }
@@ -74,11 +79,10 @@ async fn open(page: &chromiumoxide::Page, url: String) {
 }
 
 async fn text(page: &chromiumoxide::Page, id: &str) -> String {
-    page.evaluate(format!("document.getElementById('{id}').textContent"))
-        .await
-        .ok()
-        .and_then(|r| r.into_value::<String>().ok())
-        .unwrap_or_default()
+    let Ok(result) = page.evaluate(format!("document.getElementById('{id}').textContent")).await else {
+        return String::new();
+    };
+    result.into_value::<String>().unwrap_or_default()
 }
 
 /// Open the page with `scripts` injected, press Start, wait for `frames` frames.
@@ -98,7 +102,8 @@ async fn stream(t: &common::TestApp, scripts: &[&str], url_suffix: &str) -> Opti
     let error = text(&page, "error").await;
     browser.close().await.ok();
     task.abort();
-    Some((status, if state.is_empty() { error } else { state }))
+    let shown = if state.is_empty() { error } else { state };
+    Some((status, shown))
 }
 
 #[tokio::test(flavor = "multi_thread")]

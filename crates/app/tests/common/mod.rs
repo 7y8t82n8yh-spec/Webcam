@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 
 use iphone_webcam::app::{App, Settings};
 use iphone_webcam::hub::FitMode;
+use openh264::encoder::Encoder;
+use openh264::formats::{RgbSliceU8, YUVBuffer};
 use protocol::{OfferRequest, OfferResponse};
 use str0m::change::SdpAnswer;
-use str0m::media::{Direction, Frequency, MediaKind, MediaTime};
+use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
-use str0m::{Candidate, Event, Input, Output, RtcConfig};
+use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 
 pub struct TestApp {
@@ -36,7 +38,8 @@ pub fn start() -> TestApp {
 
 /// Start the app, optionally with the real Windows 11 virtual camera.
 pub fn start_with(camera: bool) -> TestApp {
-    let dir = std::env::temp_dir().join(format!("iphone-webcam-it-{}", rand::random::<u64>()));
+    let run = rand::random::<u64>();
+    let dir = std::env::temp_dir().join(format!("iphone-webcam-it-{run}"));
     let app = App::start(Settings {
         host: "127.0.0.1".parse().unwrap(),
         port: 0,
@@ -71,7 +74,8 @@ impl TestApp {
     }
 
     pub async fn status(&self) -> serde_json::Value {
-        self.client.get(format!("{}/status?k={}", self.base, self.key)).send().await.unwrap().json().await.unwrap()
+        let response = self.client.get(format!("{}/status?k={}", self.base, self.key)).send().await.unwrap();
+        response.json().await.unwrap()
     }
 
     /// Wait until `frames_in` reaches `count`; returns the last status.
@@ -101,10 +105,9 @@ impl TestApp {
 }
 
 pub fn solid_jpeg(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let pixels = rgb.repeat((w * h) as usize);
     let mut out = Vec::new();
-    jpeg_encoder::Encoder::new(&mut out, 95)
-        .encode(&rgb.repeat((w * h) as usize), w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
-        .unwrap();
+    jpeg_encoder::Encoder::new(&mut out, 95).encode(&pixels, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).unwrap();
     out
 }
 
@@ -131,25 +134,23 @@ pub async fn webrtc_phone(test: &Target, client_id: &str, rgb: [u8; 3], seconds:
     let (offer, pending) = api.apply().unwrap();
 
     let request = OfferRequest { sdp: offer.to_sdp_string(), id: client_id.into(), info: Default::default() };
-    let response: OfferResponse = test
+    let sent = test
         .client
         .post(format!("{}/offer", test.base))
         .header(protocol::KEY_HEADER, &test.key)
         .json(&request)
         .send()
         .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&response.sdp).unwrap()).unwrap();
+    let response: OfferResponse = sent.error_for_status().unwrap().json().await.unwrap();
+    let answer = SdpAnswer::from_sdp_string(&response.sdp).unwrap();
+    rtc.sdp_api().accept_answer(pending, answer).unwrap();
 
     let (w, h) = (640usize, 360usize);
     let pixels = rgb.repeat(w * h);
-    let yuv = openh264::formats::YUVBuffer::from_rgb_source(openh264::formats::RgbSliceU8::new(&pixels, (w, h)));
-    let mut encoder = openh264::encoder::Encoder::new().unwrap();
+    let source = RgbSliceU8::new(&pixels, (w, h));
+    let yuv = YUVBuffer::from_rgb_source(source);
+    let mut encoder = Encoder::new().unwrap();
 
     let mut report = PhoneReport::default();
     let start = Instant::now();
@@ -157,45 +158,59 @@ pub async fn webrtc_phone(test: &Target, client_id: &str, rgb: [u8; 3], seconds:
     let mut next_frame = start;
     let mut buf = vec![0u8; 2000];
     while Instant::now() < end {
-        let deadline = loop {
-            match rtc.poll_output().unwrap() {
-                Output::Timeout(at) => break at,
-                Output::Transmit(t) => {
-                    let _ = socket.send_to(&t.contents, t.destination).await;
-                }
-                Output::Event(event) => match event {
-                    Event::Connected => report.connected = true,
-                    Event::ChannelData(data) => {
-                        report.control_messages.push(String::from_utf8_lossy(&data.data).into_owned())
-                    }
-                    Event::KeyframeRequest(_) => encoder.force_intra_frame(),
-                    _ => {}
-                },
-            }
-        };
+        let deadline = handle_output(&mut rtc, &socket, &mut report, &mut encoder).await;
         if report.connected && Instant::now() >= next_frame {
-            let data = encoder.encode(&yuv).unwrap().to_vec();
-            let writer = rtc.writer(mid).unwrap();
-            let pt = writer.payload_params().next().unwrap().pt();
-            let rtp_time = MediaTime::new((start.elapsed().as_secs_f64() * 90_000.0) as u64, Frequency::NINETY_KHZ);
-            writer.write(pt, Instant::now(), rtp_time, data).unwrap();
+            send_frame(&mut rtc, mid, &mut encoder, &yuv, start);
             report.frames_sent += 1;
             next_frame += Duration::from_millis(33);
             continue;
         }
         let wait_until = if report.connected { deadline.min(next_frame) } else { deadline };
-        tokio::select! {
-            received = socket.recv_from(&mut buf) => {
-                let (n, source) = received.unwrap();
-                let input = Input::Receive(Instant::now(), Receive {
-                    proto: Protocol::Udp, source, destination: local, contents: buf[..n].try_into().unwrap(),
-                });
-                if rtc.accepts(&input) {
-                    rtc.handle_input(input).unwrap();
-                }
-            }
-            _ = tokio::time::sleep_until(wait_until.into()) => rtc.handle_input(Input::Timeout(Instant::now())).unwrap(),
-        }
+        receive_until(&mut rtc, &socket, local, &mut buf, wait_until).await;
     }
     report
+}
+
+/// Send what `rtc` wants sent and note its events, until it asks to be woken; returns when.
+async fn handle_output(rtc: &mut Rtc, socket: &UdpSocket, report: &mut PhoneReport, encoder: &mut Encoder) -> Instant {
+    loop {
+        match rtc.poll_output().unwrap() {
+            Output::Timeout(at) => return at,
+            Output::Transmit(t) => {
+                let _ = socket.send_to(&t.contents, t.destination).await;
+            }
+            Output::Event(Event::Connected) => report.connected = true,
+            Output::Event(Event::ChannelData(data)) => {
+                report.control_messages.push(String::from_utf8_lossy(&data.data).into_owned())
+            }
+            Output::Event(Event::KeyframeRequest(_)) => encoder.force_intra_frame(),
+            Output::Event(_) => {}
+        }
+    }
+}
+
+/// Encode one frame and write it to the video track.
+fn send_frame(rtc: &mut Rtc, mid: Mid, encoder: &mut Encoder, yuv: &YUVBuffer, start: Instant) {
+    let data = encoder.encode(yuv).unwrap().to_vec();
+    let writer = rtc.writer(mid).unwrap();
+    let pt = writer.payload_params().next().unwrap().pt();
+    let ticks = (start.elapsed().as_secs_f64() * 90_000.0) as u64;
+    let rtp_time = MediaTime::new(ticks, Frequency::NINETY_KHZ);
+    writer.write(pt, Instant::now(), rtp_time, data).unwrap();
+}
+
+/// Feed `rtc` the next packet from `socket`, or a timeout if `until` comes first.
+async fn receive_until(rtc: &mut Rtc, socket: &UdpSocket, local: SocketAddr, buf: &mut [u8], until: Instant) {
+    tokio::select! {
+        received = socket.recv_from(buf) => {
+            let (n, source) = received.unwrap();
+            let contents = buf[..n].try_into().unwrap();
+            let receive = Receive { proto: Protocol::Udp, source, destination: local, contents };
+            let input = Input::Receive(Instant::now(), receive);
+            if rtc.accepts(&input) {
+                rtc.handle_input(input).unwrap();
+            }
+        }
+        _ = tokio::time::sleep_until(until.into()) => rtc.handle_input(Input::Timeout(Instant::now())).unwrap(),
+    }
 }

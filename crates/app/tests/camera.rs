@@ -23,7 +23,9 @@ fn read_camera() -> Option<Result<Vec<f64>, String>> {
     if !output.status.success() {
         return Some(Err(format!("vcam-probe failed ({})", output.status)));
     }
-    Some(Ok(stdout.lines().last().unwrap_or_default().split_whitespace().filter_map(|v| v.parse().ok()).collect()))
+    let last_line = stdout.lines().last().unwrap_or_default();
+    let average: Vec<f64> = last_line.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    Some(Ok(average))
 }
 
 #[cfg(target_os = "linux")]
@@ -49,7 +51,8 @@ fn read_camera() -> Option<Result<Vec<f64>, String>> {
             sum[c] += px[c] as f64;
         }
     }
-    Some(Ok(sum.iter().map(|s| s / (1280.0 * 720.0)).collect()))
+    let average: Vec<f64> = sum.iter().map(|s| s / (1280.0 * 720.0)).collect();
+    Some(Ok(average))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
