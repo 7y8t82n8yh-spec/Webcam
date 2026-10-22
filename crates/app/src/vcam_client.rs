@@ -12,7 +12,7 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
 use windows::Win32::Media::KernelStreaming::{KSCATEGORY_CAPTURE, KSCATEGORY_VIDEO, KSCATEGORY_VIDEO_CAMERA};
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
 };
@@ -40,7 +40,9 @@ impl VirtualCamera {
             fs::MAX_HEIGHT
         );
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            // Keep the multithreaded apartment alive without putting this (the GUI) thread
+            // in it: the window library needs it single-threaded.
+            CoIncrementMTAUsage().context("CoIncrementMTAUsage")?;
             MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).context("MFStartup")?;
             // VIDEO and CAPTURE as well as VIDEO_CAMERA, so DirectShow-based apps list it too.
             let categories = [KSCATEGORY_VIDEO_CAMERA, KSCATEGORY_VIDEO, KSCATEGORY_CAPTURE];

@@ -52,6 +52,9 @@ struct Args {
     no_gui: bool,
     #[arg(short, long)]
     verbose: bool,
+    /// Wait for Enter before exiting with an error (set when re-run elevated).
+    #[arg(long, hide = true, global = true)]
+    pause_on_error: bool,
 }
 
 #[derive(Subcommand)]
@@ -105,9 +108,13 @@ fn main() -> Result<()> {
 
     match args.command {
         #[cfg(windows)]
-        Some(Cmd::Install { dll }) => std::process::exit(iphone_webcam::install::install(args.port, dll)?),
+        Some(Cmd::Install { dll }) => {
+            std::process::exit(pause_on_error(args.pause_on_error, iphone_webcam::install::install(args.port, dll))?)
+        }
         #[cfg(windows)]
-        Some(Cmd::Uninstall) => std::process::exit(iphone_webcam::install::uninstall()?),
+        Some(Cmd::Uninstall) => {
+            std::process::exit(pause_on_error(args.pause_on_error, iphone_webcam::install::uninstall())?)
+        }
         #[cfg(target_os = "linux")]
         Some(Cmd::Install { .. }) => std::process::exit(iphone_webcam::install::install(args.port, &args.camera_name)?),
         #[cfg(target_os = "linux")]
@@ -141,6 +148,16 @@ fn main() -> Result<()> {
     let _ = rx.recv();
     app.stop();
     Ok(())
+}
+
+/// Keep an elevated console window open long enough to read the error.
+#[cfg(windows)]
+fn pause_on_error(pause: bool, result: Result<i32>) -> Result<i32> {
+    if let (true, Err(err)) = (pause, &result) {
+        eprintln!("Error: {err:#}\n\nPress Enter to close this window.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    result
 }
 
 /// Ctrl+C (and console close) -> message on `tx`.

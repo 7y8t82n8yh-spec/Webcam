@@ -39,10 +39,54 @@ fn netsh(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Re-run this executable elevated with the same arguments and wait for it.
-fn relaunch_elevated() -> Result<i32> {
+/// Quote one argument for the command line, the way the C runtime parses it back.
+fn quote(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            // Backslashes before a quote are doubled, and the quote itself escaped.
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Same before the closing quote.
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// Re-run this executable elevated and wait for it. The elevated process starts in
+/// System32 and its console closes when it exits, so paths are made absolute and it
+/// is asked to pause on errors.
+fn relaunch_elevated(dll: Option<&Path>) -> Result<i32> {
     let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).map(|a| format!("\"{a}\"")).collect();
+    let mut args: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    for arg in std::env::args().skip(1) {
+        if std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if arg == "--dll" {
+            skip_next = true;
+        } else if !arg.starts_with("--dll=") {
+            args.push(quote(&arg));
+        }
+    }
+    if let Some(dll) = dll {
+        args.push("--dll".into());
+        args.push(quote(&dll.to_string_lossy()));
+    }
+    args.push("--pause-on-error".into());
     let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(args.join(" ")));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -102,9 +146,10 @@ fn remove_legacy() {
 }
 
 pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
+    let dll = dll.map(|p| std::path::absolute(&p).unwrap_or(p));
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         println!("Requesting administrator rights...");
-        return relaunch_elevated();
+        return relaunch_elevated(dll.as_deref());
     }
     let build = windows_build();
     if build < 22000 {
@@ -120,6 +165,11 @@ pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
     copy_replacing(&source, &target)?;
     regsvr32(&[], &target)?;
     println!("Registered the virtual camera ({}).", target.display());
+    // The camera service never unloads the DLL it has; restart it so an upgrade takes
+    // effect now. It starts again by itself when a camera is next used.
+    if Command::new("sc").args(["stop", "FrameServer"]).output().is_ok_and(|o| o.status.success()) {
+        println!("Restarted the Windows camera service.");
+    }
     remove_legacy();
 
     let _ = netsh(&["delete", "rule", &format!("name={TCP_RULE}")]);
@@ -153,7 +203,7 @@ pub fn install(port: u16, dll: Option<PathBuf>) -> Result<i32> {
 pub fn uninstall() -> Result<i32> {
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         println!("Requesting administrator rights...");
-        return relaunch_elevated();
+        return relaunch_elevated(None);
     }
     let target = install_dir().join("vcam").join(DLL_NAME);
     if target.exists() {
@@ -165,6 +215,17 @@ pub fn uninstall() -> Result<i32> {
     let _ = netsh(&["delete", "rule", &format!("name={UDP_RULE}")]);
     println!("Virtual camera and firewall rules removed.");
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn quoting_survives_backslashes_and_quotes() {
+        assert_eq!(super::quote(r"C:\dir\"), r#""C:\dir\\""#);
+        assert_eq!(super::quote(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(super::quote(r"a\b"), r#""a\b""#);
+        assert_eq!(super::quote(r#"a\"b"#), r#""a\\\"b""#);
+    }
 }
 
 fn windows_build() -> u32 {

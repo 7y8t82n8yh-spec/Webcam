@@ -126,8 +126,11 @@ impl MfH264Decoder {
             buffer.Lock(&mut ptr, None, Some(&mut len))?;
             let data = std::slice::from_raw_parts(ptr, len as usize);
             let pitch = self.allocated.0 as usize;
-            let (y, uv) = data.split_at((pitch * alloc_h as usize).min(data.len()));
-            out(&Yuv420 { width: w, height: h, y, y_stride: pitch, u: uv, v: &[], uv_stride: pitch, nv12: true });
+            let luma = pitch * alloc_h as usize;
+            if data.len() >= luma * 3 / 2 {
+                let (y, uv) = data.split_at(luma);
+                out(&Yuv420 { width: w, height: h, y, y_stride: pitch, u: uv, v: &[], uv_stride: pitch, nv12: true });
+            }
             buffer.Unlock()?;
         }
         Ok(())
