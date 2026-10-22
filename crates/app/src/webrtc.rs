@@ -19,7 +19,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::decode;
+use crate::decode::H264Decoder;
 use crate::hub::FrameHub;
 
 /// Decoder backlog (in frames) after which we skip ahead to the next keyframe.
@@ -329,7 +329,7 @@ struct DecoderThread {
 
 impl DecoderThread {
     fn spawn(hub: Arc<FrameHub>, keyframe_requests: mpsc::UnboundedSender<()>) -> Result<Self> {
-        let decoder = decode::new_decoder()?;
+        let decoder = H264Decoder::new()?;
         let (frames, rx) = std_mpsc::channel::<Encoded>();
         let backlog = Arc::new(AtomicUsize::new(0));
         let pending = backlog.clone();
@@ -346,7 +346,7 @@ impl DecoderThread {
 
 /// Body of the decoder thread.
 fn decode_loop(
-    mut decoder: Box<dyn decode::VideoDecoder>,
+    mut decoder: H264Decoder,
     rx: std_mpsc::Receiver<Encoded>,
     pending: &AtomicUsize,
     hub: &FrameHub,
@@ -368,8 +368,7 @@ fn decode_loop(
             }
             need_keyframe = false;
         }
-        let bytes = data.len();
-        if let Err(err) = decoder.decode(&data, &mut |picture| hub.push_yuv(picture, bytes)) {
+        if let Err(err) = decoder.decode(&data, |picture| hub.push_yuv(picture, data.len())) {
             tracing::debug!("decode error: {err:#}");
             hub.count_decode_error();
             need_keyframe = true;

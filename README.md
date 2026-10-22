@@ -9,8 +9,8 @@ Windows Camera app and other apps can use.
  iPhone (Safari)                                  Windows 11 PC
 ┌──────────────────┐  WebRTC video (H.264, UDP)  ┌──────────────────────────────┐
 │ page (Rust→wasm) │ ──────────────────────────▶ │ iphone-webcam.exe            │
-│ camera           │  signalling over HTTPS      │  Media Foundation H.264      │
-│ screen kept awake│                             │  decoder ─▶ shared memory    │
+│ camera           │  signalling over HTTPS      │  OpenH264 decoder            │
+│ screen kept awake│                             │  ─▶ shared memory            │
 └──────────────────┘                             └──────────────┬───────────────┘
                                                                 ▼
                                    Windows camera service loads iPhoneWebcamVCam.dll
@@ -18,11 +18,11 @@ Windows Camera app and other apps can use.
 ```
 
 The phone sends its camera as a WebRTC video stream: H.264 encoded in hardware on the
-iPhone, with congestion control that adapts to the Wi-Fi. On Windows the PC decodes it
-with Windows' own H.264 decoder; on Linux with Cisco's OpenH264, built into the app.
-On Linux the camera is a [v4l2loopback](https://github.com/umlaeute/v4l2loopback)
-device instead of the Windows 11 camera shown above. If WebRTC can't connect, usually because a firewall blocks
-UDP, the page falls back to sending JPEG frames over a WebSocket, and to HTTPS uploads
+iPhone, with congestion control that adapts to the Wi-Fi. The PC decodes it with
+Cisco's OpenH264, built into the app. On Linux the camera is a
+[v4l2loopback](https://github.com/umlaeute/v4l2loopback) device instead of the
+Windows 11 camera shown above. If WebRTC can't connect, usually because a firewall
+blocks UDP, the page falls back to sending JPEG frames over a WebSocket, and to HTTPS uploads
 if WebSockets are refused too. The phone's status bar shows which one is in use.
 
 Everything is written in Rust: the PC app, the camera DLL, and the phone page, which is
@@ -175,7 +175,7 @@ programs as artifacts.
 | `crates/web` | The phone page in Rust/WebAssembly: camera, wake lock, WebRTC sender, JPEG fallbacks |
 | `crates/app/src/server.rs` | HTTPS server: page, `/offer` WebRTC signalling, `/ws` and `/frame` fallbacks, `/ca.crt` |
 | `crates/app/src/webrtc.rs` | WebRTC receiver ([str0m](https://github.com/algesten/str0m)) and decoder thread |
-| `crates/app/src/mf_decode.rs` | Windows Media Foundation H.264 decoder |
+| `crates/app/src/decode.rs` | H.264 decoding (OpenH264) |
 | `crates/app/src/hub.rs` | Latest frame, colour conversion, letterboxing, the "waiting" image |
 | `crates/app/src/vcam_client.rs` | Creates the Windows 11 camera and hands it frames through shared memory |
 | `crates/app/src/v4l2.rs` | Linux camera: writes frames to a v4l2loopback device |

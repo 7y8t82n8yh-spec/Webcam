@@ -54,7 +54,7 @@ jobs:
       - name: Build (release, all targets)
         run: cargo build --release --workspace --all-targets
 
-      - name: Tests (Media Foundation decoder, headless Chrome with a fake camera)
+      - name: Tests (headless Chrome with a fake camera)
         shell: pwsh
         run: |
           $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"

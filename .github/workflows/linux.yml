@@ -52,7 +52,7 @@ jobs:
       - name: Build (release, all targets)
         run: cargo build --release --workspace --all-targets
 
-      - name: Tests (OpenH264 decoder, headless Chrome with a fake camera)
+      - name: Tests (headless Chrome with a fake camera)
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: cargo test --release --workspace --no-fail-fast

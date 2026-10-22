@@ -30,17 +30,15 @@ impl Frame {
     }
 }
 
-/// A decoded 4:2:0 picture (I420 or NV12) as handed over by a video decoder.
+/// A decoded I420 picture: a full-size Y plane and half-size U and V planes.
 pub struct Yuv420<'a> {
     pub width: u32,
     pub height: u32,
     pub y: &'a [u8],
-    pub y_stride: usize,
-    /// For NV12 `u` holds the interleaved UV plane and `v` is unused.
     pub u: &'a [u8],
     pub v: &'a [u8],
+    pub y_stride: usize,
     pub uv_stride: usize,
-    pub nv12: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -203,14 +201,8 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
 pub fn convert_yuv(p: &Yuv420, w: u32, h: u32, mode: FitMode) -> Frame {
     let sample = |x: u32, y: u32| {
         let luma = p.y[y as usize * p.y_stride + x as usize];
-        let (cx, cy) = ((x / 2) as usize, (y / 2) as usize);
-        let (u, v) = if p.nv12 {
-            let i = cy * p.uv_stride + cx * 2;
-            (p.u[i], p.u[i + 1])
-        } else {
-            (p.u[cy * p.uv_stride + cx], p.v[cy * p.uv_stride + cx])
-        };
-        yuv_to_rgb(luma, u, v)
+        let chroma = (y / 2) as usize * p.uv_stride + (x / 2) as usize;
+        yuv_to_rgb(luma, p.u[chroma], p.v[chroma])
     };
     resample(p.width, p.height, w, h, mode, sample)
 }
@@ -309,7 +301,7 @@ mod tests {
         let y = vec![137u8; 8];
         let u = vec![78u8; 2];
         let v = vec![177u8; 2];
-        let p = Yuv420 { width: w, height: h, y: &y, y_stride: 4, u: &u, v: &v, uv_stride: 2, nv12: false };
+        let p = Yuv420 { width: w, height: h, y: &y, u: &u, v: &v, y_stride: 4, uv_stride: 2 };
         let f = convert_yuv(&p, 4, 2, FitMode::Fit);
         let got = px(&f, 1, 1);
         for (g, want) in got.iter().zip([220u8, 120, 40]) {

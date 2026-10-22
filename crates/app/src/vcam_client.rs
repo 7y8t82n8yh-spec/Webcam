@@ -43,7 +43,9 @@ impl VirtualCamera {
             // Keep the multithreaded apartment alive without putting this (the GUI) thread
             // in it: the window library needs it single-threaded.
             CoIncrementMTAUsage().context("CoIncrementMTAUsage")?;
-            crate::mf_decode::start_media_foundation()?;
+            // Started for good: shutting Media Foundation down while any of its objects
+            // are still alive crashes.
+            MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).context("MFStartup")?;
             // VIDEO and CAPTURE as well as VIDEO_CAMERA, so DirectShow-based apps list it too.
             let categories = [KSCATEGORY_VIDEO_CAMERA, KSCATEGORY_VIDEO, KSCATEGORY_CAPTURE];
             let camera = MFCreateVirtualCamera(

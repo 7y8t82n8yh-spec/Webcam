@@ -19,8 +19,6 @@ pub mod install;
 #[cfg(target_os = "linux")]
 #[path = "install_linux.rs"]
 pub mod install;
-#[cfg(windows)]
-pub mod mf_decode;
 #[cfg(target_os = "linux")]
 pub mod v4l2;
 #[cfg(windows)]
