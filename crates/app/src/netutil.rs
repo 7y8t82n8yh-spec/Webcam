@@ -22,10 +22,9 @@ pub fn lan_ips() -> Vec<IpAddr> {
     let primary = primary_ip();
     let mut found: Vec<Ipv4Addr> = primary.into_iter().collect();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if let IpAddr::V4(ip) = iface.ip() {
-            if usable(&ip) && !found.contains(&ip) {
-                found.push(ip);
-            }
+        let IpAddr::V4(ip) = iface.ip() else { continue };
+        if usable(&ip) && !found.contains(&ip) {
+            found.push(ip);
         }
     }
     found.sort_by_key(|ip| (!ip.is_private(), Some(*ip) != primary));

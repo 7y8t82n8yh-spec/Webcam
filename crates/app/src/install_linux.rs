@@ -29,7 +29,8 @@ fn ensure_root() -> Option<Result<i32>> {
     }
     println!("Administrator rights are needed; running with sudo...");
     let run = || -> Result<i32> {
-        let status = Command::new("sudo").arg(std::env::current_exe()?).args(std::env::args_os().skip(1)).status()?;
+        let exe = std::env::current_exe()?;
+        let status = Command::new("sudo").arg(exe).args(std::env::args_os().skip(1)).status()?;
         Ok(status.code().unwrap_or(1))
     };
     Some(run().context("running sudo"))

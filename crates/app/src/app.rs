@@ -58,6 +58,60 @@ pub fn load_or_create_key(dir: &Path) -> Result<String> {
     Ok(key)
 }
 
+/// Body of the server thread: serve until `shutdown` fires, reporting the bound address
+/// (or why it couldn't listen) on `bound_tx`.
+fn run_server(
+    server: Arc<Server>,
+    addr: SocketAddr,
+    cert: Vec<u8>,
+    cert_key: Vec<u8>,
+    shutdown: oneshot::Receiver<()>,
+    bound_tx: std::sync::mpsc::Sender<Result<SocketAddr, String>>,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    let router = server.clone().router();
+    let bound_ok = bound_tx.clone();
+    let on_shutdown = async move {
+        let _ = shutdown.await;
+        server.shutdown();
+    };
+    let on_bound = move |bound| {
+        let _ = bound_ok.send(Ok(bound));
+    };
+    let serving = server::serve(router, addr, cert, cert_key, on_shutdown, on_bound);
+    if let Err(err) = runtime.block_on(serving) {
+        let _ = bound_tx.send(Err(format!("{err:#}")));
+    }
+}
+
+/// The page URLs to show, one per LAN address (localhost if there is none).
+fn pairing_urls(ips: &[IpAddr], port: u16, key: &str) -> Vec<String> {
+    let mut url_ips = ips.to_vec();
+    if url_ips.is_empty() {
+        url_ips.push(IpAddr::from([127, 0, 0, 1]));
+    }
+    url_ips.iter().map(|ip| format!("https://{ip}:{port}/?k={key}")).collect()
+}
+
+/// Open the virtual camera unless it's disabled, recording the outcome in `status`.
+fn open_camera(settings: &Settings, status: &Mutex<String>) -> Option<Box<dyn CameraSink>> {
+    if !settings.camera {
+        *status.lock().unwrap() = "disabled (--no-camera)".into();
+        return None;
+    }
+    match camera::open(&settings.camera_name, settings.width, settings.height) {
+        Ok(sink) => {
+            *status.lock().unwrap() = sink.describe();
+            Some(sink)
+        }
+        Err(err) => {
+            tracing::error!("virtual camera unavailable: {err:#}");
+            *status.lock().unwrap() = format!("unavailable: {err:#}");
+            None
+        }
+    }
+}
+
 impl App {
     pub fn start(settings: Settings) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -79,59 +133,20 @@ impl App {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (bound_tx, bound_rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
-        let router = server.clone().router();
         let addr = SocketAddr::new(settings.host, settings.port);
         let (cert, cert_key) = (certs.server_cert_pem, certs.server_key_pem);
-        let server_for_shutdown = server.clone();
-        let server_thread = std::thread::Builder::new().name("server".into()).spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-            let bound_ok = bound_tx.clone();
-            let result = runtime.block_on(server::serve(
-                router,
-                addr,
-                cert,
-                cert_key,
-                async move {
-                    let _ = shutdown_rx.await;
-                    server_for_shutdown.shutdown();
-                },
-                move |bound| {
-                    let _ = bound_ok.send(Ok(bound));
-                },
-            ));
-            if let Err(err) = result {
-                let _ = bound_tx.send(Err(format!("{err:#}")));
-            }
-        })?;
+        let server_for_thread = server.clone();
+        let serve = move || run_server(server_for_thread, addr, cert, cert_key, shutdown_rx, bound_tx);
+        let server_thread = std::thread::Builder::new().name("server".into()).spawn(serve)?;
         let bound = bound_rx
             .recv_timeout(Duration::from_secs(10))
             .context("server did not start")?
             .map_err(|e| anyhow::anyhow!("could not listen on {addr}: {e}"))?;
 
-        let port = bound.port();
-        let mut url_ips = ips.clone();
-        if url_ips.is_empty() {
-            url_ips.push(IpAddr::from([127, 0, 0, 1]));
-        }
-        let urls = url_ips.iter().map(|ip| format!("https://{ip}:{port}/?k={key}")).collect();
+        let urls = pairing_urls(&ips, bound.port(), &key);
 
         let camera_status = Arc::new(Mutex::new(String::from("not started")));
-        let sink: Option<Box<dyn CameraSink>> = if settings.camera {
-            match camera::open(&settings.camera_name, settings.width, settings.height) {
-                Ok(sink) => {
-                    *camera_status.lock().unwrap() = sink.describe();
-                    Some(sink)
-                }
-                Err(err) => {
-                    tracing::error!("virtual camera unavailable: {err:#}");
-                    *camera_status.lock().unwrap() = format!("unavailable: {err:#}");
-                    None
-                }
-            }
-        } else {
-            *camera_status.lock().unwrap() = "disabled (--no-camera)".into();
-            None
-        };
+        let sink = open_camera(&settings, &camera_status);
         let camera_thread = camera::OutputThread::spawn(hub.clone(), sink, settings.fps, camera_status.clone());
 
         Ok(Self {

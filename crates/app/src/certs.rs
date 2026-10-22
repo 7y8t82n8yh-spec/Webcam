@@ -9,7 +9,7 @@
 //! still can't be used to impersonate other websites to a phone that trusts it.
 
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -54,12 +54,14 @@ struct ServerMeta {
 
 pub fn permitted(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => PERMITTED_NETWORKS.iter().any(|(net, prefix)| {
-            let mask = if *prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-            u32::from(v4) & mask == u32::from_be_bytes(*net) & mask
-        }),
+        IpAddr::V4(v4) => PERMITTED_NETWORKS.iter().any(|(net, prefix)| in_network(v4, *net, *prefix)),
         IpAddr::V6(_) => false,
     }
+}
+
+fn in_network(ip: Ipv4Addr, net: [u8; 4], prefix: u8) -> bool {
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    u32::from(ip) & mask == u32::from_be_bytes(net) & mask
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -114,53 +116,22 @@ pub fn ensure(dir: &Path, ips: &[IpAddr]) -> Result<Certificates> {
         create_ca(dir)?;
     }
     let ca_pem = fs::read_to_string(dir.join("ca.crt"))?;
-    let ca_key = KeyPair::from_pem(&fs::read_to_string(dir.join("ca.key"))?)?;
+    let ca_key_pem = fs::read_to_string(dir.join("ca.key"))?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem)?;
     let ca_der = pem_to_der(&ca_pem)?;
+    let ca_sha256 = sha256_hex(&ca_der);
 
-    let mut hosts: Vec<String> = ips.iter().filter(|ip| permitted(**ip)).map(|ip| ip.to_string()).collect();
-    hosts.push("127.0.0.1".into());
-    hosts.push("localhost".into());
-    hosts.sort();
-    hosts.dedup();
-
+    let hosts = certificate_hosts(ips);
     let meta_path = dir.join("server.json");
     let now = OffsetDateTime::now_utc();
     let current: Option<ServerMeta> = fs::read(&meta_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
-    let reuse = current.is_some_and(|m| {
-        m.ca_sha256 == sha256_hex(&ca_der)
-            && hosts.iter().all(|h| m.hosts.contains(h))
-            && m.not_after_unix - now.unix_timestamp() > Duration::days(7).whole_seconds()
-    }) && dir.join("server.crt").exists()
+    let reuse = current.is_some_and(|m| covers(&m, &ca_sha256, &hosts, now))
+        && dir.join("server.crt").exists()
         && dir.join("server.key").exists();
 
     if !reuse {
-        let key = KeyPair::generate()?;
-        let mut params = CertificateParams::default();
-        let mut name = DistinguishedName::new();
-        name.push(DnType::CommonName, "iPhone Webcam");
-        params.distinguished_name = name;
-        params.not_before = now - Duration::minutes(5);
-        params.not_after = now + SERVER_VALIDITY;
-        params.is_ca = IsCa::ExplicitNoCa;
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.use_authority_key_identifier_extension = true;
-        params.subject_alt_names = hosts
-            .iter()
-            .map(|h| match h.parse::<IpAddr>() {
-                Ok(ip) => Ok(SanType::IpAddress(ip)),
-                Err(_) => Ok(SanType::DnsName(h.as_str().try_into()?)),
-            })
-            .collect::<Result<_, rcgen::Error>>()?;
-        let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)?;
-        let cert = params.signed_by(&key, &issuer)?;
-        fs::write(dir.join("server.crt"), cert.pem())?;
-        fs::write(dir.join("server.key"), key.serialize_pem())?;
-        let meta = ServerMeta {
-            ca_sha256: sha256_hex(&ca_der),
-            hosts: hosts.clone(),
-            not_after_unix: params.not_after.unix_timestamp(),
-        };
+        let not_after = issue_server_cert(dir, &ca_pem, ca_key, &hosts, now)?;
+        let meta = ServerMeta { ca_sha256, hosts: hosts.clone(), not_after_unix: not_after.unix_timestamp() };
         fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
         tracing::info!("Issued server certificate for {}", hosts.join(", "));
     }
@@ -171,6 +142,58 @@ pub fn ensure(dir: &Path, ips: &[IpAddr]) -> Result<Certificates> {
         ca_cert_der: ca_der,
         ca_cert_path: dir.join("ca.crt"),
     })
+}
+
+/// The names the server certificate is issued for: the permitted `ips` plus localhost.
+fn certificate_hosts(ips: &[IpAddr]) -> Vec<String> {
+    let mut hosts: Vec<String> = ips.iter().filter(|ip| permitted(**ip)).map(|ip| ip.to_string()).collect();
+    hosts.push("127.0.0.1".into());
+    hosts.push("localhost".into());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Whether the certificate described by `meta` is from this CA, covers `hosts` and
+/// stays valid for a while yet.
+fn covers(meta: &ServerMeta, ca_sha256: &str, hosts: &[String], now: OffsetDateTime) -> bool {
+    meta.ca_sha256 == ca_sha256
+        && hosts.iter().all(|h| meta.hosts.contains(h))
+        && meta.not_after_unix - now.unix_timestamp() > Duration::days(7).whole_seconds()
+}
+
+/// Sign a new server certificate for `hosts` and write it to `dir`. Returns its expiry.
+fn issue_server_cert(
+    dir: &Path,
+    ca_pem: &str,
+    ca_key: KeyPair,
+    hosts: &[String],
+    now: OffsetDateTime,
+) -> Result<OffsetDateTime> {
+    let key = KeyPair::generate()?;
+    let mut params = CertificateParams::default();
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, "iPhone Webcam");
+    params.distinguished_name = name;
+    params.not_before = now - Duration::minutes(5);
+    params.not_after = now + SERVER_VALIDITY;
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.use_authority_key_identifier_extension = true;
+    params.subject_alt_names = hosts.iter().map(|h| subject_alt_name(h)).collect::<Result<_, rcgen::Error>>()?;
+    let issuer = Issuer::from_ca_cert_pem(ca_pem, ca_key)?;
+    let cert = params.signed_by(&key, &issuer)?;
+    fs::write(dir.join("server.crt"), cert.pem())?;
+    fs::write(dir.join("server.key"), key.serialize_pem())?;
+    Ok(params.not_after)
+}
+
+fn subject_alt_name(host: &str) -> Result<SanType, rcgen::Error> {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => Ok(SanType::IpAddress(ip)),
+        Err(_) => Ok(SanType::DnsName(host.try_into()?)),
+    }
 }
 
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
@@ -205,7 +228,8 @@ mod tests {
         let c = ensure(&dir, &[ip("10.0.0.5"), ip("8.8.8.8")]).unwrap();
         assert_ne!(a.server_cert_pem, c.server_cert_pem, "new host -> reissued");
         assert_eq!(a.ca_cert_der, c.ca_cert_der, "CA kept");
-        let meta: ServerMeta = serde_json::from_slice(&fs::read(dir.join("server.json")).unwrap()).unwrap();
+        let meta_json = fs::read(dir.join("server.json")).unwrap();
+        let meta: ServerMeta = serde_json::from_slice(&meta_json).unwrap();
         assert!(meta.hosts.contains(&"10.0.0.5".to_string()));
         assert!(!meta.hosts.contains(&"8.8.8.8".to_string()), "public IP left out");
 

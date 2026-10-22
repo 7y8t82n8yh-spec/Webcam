@@ -30,20 +30,16 @@ fn run(cmd: &mut Command) {
 fn web() {
     let root = root();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    run(Command::new(&cargo).current_dir(&root).args([
-        "build",
-        "--release",
-        "-p",
-        "web",
-        "--target",
-        "wasm32-unknown-unknown",
-    ]));
+    let mut build = Command::new(&cargo);
+    build.current_dir(&root).args(["build", "--release", "-p", "web", "--target", "wasm32-unknown-unknown"]);
+    run(&mut build);
     let dist = root.join("crates/app/web-dist");
-    std::fs::create_dir_all(dist.join("pkg")).unwrap();
-    run(Command::new("wasm-bindgen")
-        .arg(root.join("target/wasm32-unknown-unknown/release/web.wasm"))
-        .args(["--target", "web", "--no-typescript", "--out-name", "web", "--out-dir"])
-        .arg(dist.join("pkg")));
+    let pkg = dist.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let wasm = root.join("target/wasm32-unknown-unknown/release/web.wasm");
+    let mut bindgen = Command::new("wasm-bindgen");
+    bindgen.arg(wasm).args(["--target", "web", "--no-typescript", "--out-name", "web", "--out-dir"]).arg(&pkg);
+    run(&mut bindgen);
     std::fs::copy(root.join("crates/web/static/index.html"), dist.join("index.html")).unwrap();
     let size = std::fs::metadata(dist.join("pkg/web_bg.wasm")).map(|m| m.len()).unwrap_or(0);
     eprintln!("phone page built into {} ({} KB of WebAssembly)", dist.display(), size / 1024);

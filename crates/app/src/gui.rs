@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
 
 use crate::app::App;
+use crate::hub::Stats;
 
 const PREVIEW_WIDTH: usize = 384;
 
@@ -50,11 +51,12 @@ fn preview_image(app: &App) -> ColorImage {
     ColorImage::from_rgb([pw, ph], &rgb)
 }
 
-impl eframe::App for Window {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+impl Window {
+    /// Re-render the QR code when another URL is picked, and the preview every 100 ms.
+    fn refresh_textures(&mut self, ctx: &egui::Context) {
         if self.qr.as_ref().is_none_or(|(i, _)| *i != self.selected_url) {
-            let texture = ctx.load_texture("qr", qr_image(&self.app.urls[self.selected_url]), TextureOptions::NEAREST);
+            let image = qr_image(&self.app.urls[self.selected_url]);
+            let texture = ctx.load_texture("qr", image, TextureOptions::NEAREST);
             self.qr = Some((self.selected_url, texture));
         }
         if self.preview.is_none() || self.last_preview.elapsed() > Duration::from_millis(100) {
@@ -65,64 +67,84 @@ impl eframe::App for Window {
             }
             self.last_preview = Instant::now();
         }
-        let stats = self.app.hub.stats();
+    }
+
+    fn update_fps(&mut self, stats: &Stats) {
         if self.fps.0.elapsed() >= Duration::from_secs(1) {
             let dt = self.fps.0.elapsed().as_secs_f64();
             self.fps = (Instant::now(), stats.frames_in, (stats.frames_in - self.fps.1) as f64 / dt);
         }
+    }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Scan with the iPhone camera").strong());
-                    if let Some((_, qr)) = &self.qr {
-                        ui.add(egui::Image::new(qr).fit_to_exact_size(egui::vec2(220.0, 220.0)));
-                    }
-                    egui::ComboBox::from_id_salt("url")
-                        .width(300.0)
-                        .selected_text(&self.app.urls[self.selected_url])
-                        .show_ui(ui, |ui| {
-                            for (i, url) in self.app.urls.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_url, i, url);
-                            }
-                        });
-                    if ui.button("Copy URL").clicked() {
-                        ctx.copy_text(self.app.urls[self.selected_url].clone());
-                    }
-                    ui.label(
-                        RichText::new(
-                            "Same Wi-Fi as this PC. The first time, Safari warns about\n\
-                             the certificate: tap Show Details > visit this website.",
-                        )
-                        .weak(),
-                    );
-                });
-                ui.add_space(16.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Preview").strong());
-                    if let Some(preview) = &self.preview {
-                        ui.image(preview);
-                    }
-                    let status = if self.app.hub.streaming() {
-                        let (w, h) = stats.source_size;
-                        format!("● Streaming from iPhone ({}) — {w}×{h}, {:.0} fps", stats.transport, self.fps.2)
-                    } else {
-                        "○ Waiting for iPhone…".to_string()
-                    };
-                    ui.label(status);
-                    ui.label(
-                        RichText::new(format!(
-                            "Virtual camera: {}, {}×{} @ {} fps",
-                            self.app.camera_status.lock().unwrap(),
-                            self.app.hub.width,
-                            self.app.hub.height,
-                            self.app.settings.fps
-                        ))
-                        .weak(),
-                    );
-                });
-            });
-        });
+    fn columns(&mut self, ui: &mut egui::Ui, stats: &Stats) {
+        ui.vertical(|ui| self.qr_column(ui));
+        ui.add_space(16.0);
+        ui.vertical(|ui| self.preview_column(ui, stats));
+    }
+
+    /// The QR code to scan and the URL it holds.
+    fn qr_column(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Scan with the iPhone camera").strong());
+        if let Some((_, qr)) = &self.qr {
+            let image = egui::Image::new(qr).fit_to_exact_size(egui::vec2(220.0, 220.0));
+            ui.add(image);
+        }
+        egui::ComboBox::from_id_salt("url")
+            .width(300.0)
+            .selected_text(&self.app.urls[self.selected_url])
+            .show_ui(ui, |ui| url_choices(ui, &self.app.urls, &mut self.selected_url));
+        if ui.button("Copy URL").clicked() {
+            ui.ctx().copy_text(self.app.urls[self.selected_url].clone());
+        }
+        let hint = RichText::new(
+            "Same Wi-Fi as this PC. The first time, Safari warns about\n\
+             the certificate: tap Show Details > visit this website.",
+        )
+        .weak();
+        ui.label(hint);
+    }
+
+    /// The live preview and what the phone and virtual camera are doing.
+    fn preview_column(&self, ui: &mut egui::Ui, stats: &Stats) {
+        ui.label(RichText::new("Preview").strong());
+        if let Some(preview) = &self.preview {
+            ui.image(preview);
+        }
+        let status = if self.app.hub.streaming() {
+            let (w, h) = stats.source_size;
+            format!("● Streaming from iPhone ({}) — {w}×{h}, {:.0} fps", stats.transport, self.fps.2)
+        } else {
+            "○ Waiting for iPhone…".to_string()
+        };
+        ui.label(status);
+        let camera = format!(
+            "Virtual camera: {}, {}×{} @ {} fps",
+            self.app.camera_status.lock().unwrap(),
+            self.app.hub.width,
+            self.app.hub.height,
+            self.app.settings.fps
+        );
+        ui.label(RichText::new(camera).weak());
+    }
+}
+
+fn url_choices(ui: &mut egui::Ui, urls: &[String], selected: &mut usize) {
+    for (i, url) in urls.iter().enumerate() {
+        ui.selectable_value(selected, i, url);
+    }
+}
+
+impl eframe::App for Window {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.refresh_textures(&ctx);
+        let stats = self.app.hub.stats();
+        self.update_fps(&stats);
+
+        let panel = |ui: &mut egui::Ui| {
+            ui.horizontal_top(|ui| self.columns(ui, &stats));
+        };
+        egui::CentralPanel::default().show(ui, panel);
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 }

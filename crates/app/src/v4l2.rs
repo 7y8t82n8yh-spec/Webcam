@@ -70,18 +70,23 @@ fn query(file: &File) -> Option<(String, String)> {
 
 /// v4l2loopback devices as (path, label), in device order.
 pub fn loopback_devices() -> Vec<(PathBuf, String)> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir("/dev")
-        .map(|dir| dir.flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().starts_with("/dev/video")).collect())
-        .unwrap_or_default();
-    paths.sort_by_key(|p| p.to_string_lossy().trim_start_matches("/dev/video").parse::<u32>().unwrap_or(u32::MAX));
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let file = OpenOptions::new().read(true).write(true).open(&path).ok()?;
-            let (driver, card) = query(&file)?;
-            (driver == "v4l2 loopback").then_some((path, card))
-        })
-        .collect()
+    let Ok(dir) = std::fs::read_dir("/dev") else { return Vec::new() };
+    let mut paths: Vec<PathBuf> =
+        dir.flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().starts_with("/dev/video")).collect();
+    paths.sort_by_key(|p| device_number(p));
+    paths.into_iter().filter_map(loopback_label).collect()
+}
+
+/// N of `/dev/videoN`, for sorting.
+fn device_number(path: &Path) -> u32 {
+    path.to_string_lossy().trim_start_matches("/dev/video").parse::<u32>().unwrap_or(u32::MAX)
+}
+
+/// `(path, label)` if `path` is a v4l2loopback device.
+fn loopback_label(path: PathBuf) -> Option<(PathBuf, String)> {
+    let file = OpenOptions::new().read(true).write(true).open(&path).ok()?;
+    let (driver, card) = query(&file)?;
+    (driver == "v4l2 loopback").then_some((path, card))
 }
 
 pub struct LoopbackCamera {

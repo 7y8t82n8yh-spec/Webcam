@@ -14,7 +14,7 @@ use protocol::ServerMessage;
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
 use str0m::media::{KeyframeRequestKind, Mid};
-use str0m::net::{Protocol, Receive};
+use str0m::net::{Protocol, Receive, Transmit};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -55,47 +55,64 @@ pub fn with_start_bitrate(sdp: &str, kbps: u32) -> String {
     let hint = format!("x-google-start-bitrate={kbps}");
     let mut out: Vec<String> = Vec::new();
     let mut in_video = false;
-    // Payload type -> index of its rtpmap line in `out`, and those that have an fmtp.
-    let mut codecs: Vec<(String, usize)> = Vec::new();
-    let mut with_fmtp: Vec<String> = Vec::new();
-    let finish = |out: &mut Vec<String>, codecs: &mut Vec<(String, usize)>, with_fmtp: &mut Vec<String>| {
-        // Codecs without an fmtp line get one right after their rtpmap (back to front so
-        // the recorded indices stay valid).
-        for (pt, idx) in codecs.iter().rev() {
-            if !with_fmtp.contains(pt) {
-                out.insert(idx + 1, format!("a=fmtp:{pt} {hint}"));
-            }
-        }
-        codecs.clear();
-        with_fmtp.clear();
-    };
+    let mut section = VideoSection::default();
     for line in sdp.lines() {
         let mut line = line.to_string();
         if line.starts_with("m=") {
-            finish(&mut out, &mut codecs, &mut with_fmtp);
+            section.finish(&mut out, &hint);
             in_video = line.starts_with("m=video");
         } else if in_video {
-            if let Some(rest) = line.strip_prefix("a=rtpmap:") {
-                let (pt, codec) = rest.split_once(' ').unwrap_or((rest, ""));
-                let name = codec.split('/').next().unwrap_or("").to_ascii_lowercase();
-                if !["rtx", "red", "ulpfec", "flexfec-03"].contains(&name.as_str()) {
-                    codecs.push((pt.to_string(), out.len()));
-                }
-            } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
-                let pt = rest.split(' ').next().unwrap_or("").to_string();
-                if codecs.iter().any(|(p, _)| *p == pt) {
-                    line.push(';');
-                    line.push_str(&hint);
-                    with_fmtp.push(pt);
-                }
-            }
+            section.attribute(&mut line, out.len(), &hint);
         }
         out.push(line);
     }
-    finish(&mut out, &mut codecs, &mut with_fmtp);
+    section.finish(&mut out, &hint);
     let mut sdp = out.join("\r\n");
     sdp.push_str("\r\n");
     sdp
+}
+
+/// The codecs of the video section being rewritten.
+#[derive(Default)]
+struct VideoSection {
+    /// Payload type -> index of its rtpmap line in the output.
+    codecs: Vec<(String, usize)>,
+    /// Payload types that have an fmtp line.
+    with_fmtp: Vec<String>,
+}
+
+impl VideoSection {
+    /// Look at an attribute line that goes to output index `index`: note codecs, and add
+    /// `hint` to their fmtp lines.
+    fn attribute(&mut self, line: &mut String, index: usize, hint: &str) {
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            let (pt, codec) = rest.split_once(' ').unwrap_or((rest, ""));
+            let name = codec.split('/').next().unwrap_or("").to_ascii_lowercase();
+            if !["rtx", "red", "ulpfec", "flexfec-03"].contains(&name.as_str()) {
+                self.codecs.push((pt.to_string(), index));
+            }
+            return;
+        }
+        let Some(rest) = line.strip_prefix("a=fmtp:") else { return };
+        let pt = rest.split(' ').next().unwrap_or("").to_string();
+        if self.codecs.iter().any(|(p, _)| *p == pt) {
+            line.push(';');
+            line.push_str(hint);
+            self.with_fmtp.push(pt);
+        }
+    }
+
+    /// End of the section: codecs without an fmtp line get one right after their rtpmap
+    /// (back to front so the recorded indices stay valid).
+    fn finish(&mut self, out: &mut Vec<String>, hint: &str) {
+        for (pt, idx) in self.codecs.iter().rev() {
+            if !self.with_fmtp.contains(pt) {
+                out.insert(idx + 1, format!("a=fmtp:{pt} {hint}"));
+            }
+        }
+        self.codecs.clear();
+        self.with_fmtp.clear();
+    }
 }
 
 fn rtc_config() -> RtcConfig {
@@ -120,16 +137,7 @@ pub async fn start(
     let offer = SdpOffer::from_sdp_string(offer_sdp).context("invalid SDP offer")?;
     let mut rtc = rtc_config().build(Instant::now());
 
-    // One UDP socket per local address, so we know which address a packet arrived on.
-    let mut sockets = Vec::new();
-    for ip in ips.iter().chain(std::iter::once(&IpAddr::from([127, 0, 0, 1]))) {
-        let Ok(socket) = UdpSocket::bind(SocketAddr::new(*ip, 0)).await else { continue };
-        let addr = socket.local_addr()?;
-        if let Ok(candidate) = Candidate::host(addr, "udp") {
-            rtc.add_local_candidate(candidate);
-            sockets.push(Arc::new(socket));
-        }
-    }
+    let sockets = bind_candidates(&mut rtc, ips).await?;
     anyhow::ensure!(!sockets.is_empty(), "no usable network address for WebRTC");
 
     let answer = rtc.sdp_api().accept_offer(offer).context("offer not acceptable (no H.264?)")?;
@@ -139,109 +147,159 @@ pub async fn start(
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) as u64;
     let (commands, command_rx) = mpsc::unbounded_channel();
     let session = RtcSession { id, client_id: client_id.clone(), commands };
-    tokio::spawn(async move {
+    let session_task = async move {
         if let Err(err) = run(rtc, sockets, command_rx, hub).await {
             tracing::warn!("WebRTC session {client_id} ended: {err:#}");
         } else {
             tracing::info!("WebRTC session {client_id} ended");
         }
         on_end(id);
-    });
+    };
+    tokio::spawn(session_task);
     Ok((answer, session))
 }
 
+/// One UDP socket per local address, so we know which address a packet arrived on.
+/// Each one becomes a host candidate of `rtc`.
+async fn bind_candidates(rtc: &mut Rtc, ips: &[IpAddr]) -> Result<Vec<Arc<UdpSocket>>> {
+    let loopback = IpAddr::from([127, 0, 0, 1]);
+    let mut sockets = Vec::new();
+    for ip in ips.iter().chain(std::iter::once(&loopback)) {
+        let Ok(socket) = UdpSocket::bind(SocketAddr::new(*ip, 0)).await else { continue };
+        let addr = socket.local_addr()?;
+        if let Ok(candidate) = Candidate::host(addr, "udp") {
+            rtc.add_local_candidate(candidate);
+            sockets.push(Arc::new(socket));
+        }
+    }
+    Ok(sockets)
+}
+
 async fn run(
-    mut rtc: Rtc,
+    rtc: Rtc,
     sockets: Vec<Arc<UdpSocket>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     hub: Arc<FrameHub>,
 ) -> Result<()> {
     // Datagrams from all sockets are funnelled into one channel.
-    let (packet_tx, mut packets) = mpsc::channel::<(Vec<u8>, SocketAddr, SocketAddr)>(256);
-    let mut readers = Vec::new();
-    for socket in &sockets {
-        let socket = socket.clone();
-        let tx = packet_tx.clone();
-        readers.push(tokio::spawn(async move {
-            let local = socket.local_addr().expect("bound socket");
-            let mut buf = vec![0u8; 2000];
-            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
-                if tx.send((buf[..n].to_vec(), from, local)).await.is_err() {
-                    break;
-                }
-            }
-        }));
-    }
+    let (packet_tx, mut packets) = mpsc::channel::<Packet>(256);
+    let readers = sockets.iter().map(|socket| tokio::spawn(read_socket(socket.clone(), packet_tx.clone()))).collect();
     let _abort_readers = AbortOnDrop(readers);
 
     let (keyframe_tx, mut keyframe_requests) = mpsc::unbounded_channel::<()>();
     let decoder = DecoderThread::spawn(hub, keyframe_tx)?;
-    let mut channel: Option<ChannelId> = None;
-    let mut video: Option<Mid> = None;
+    let mut conn = Connection { rtc, sockets, decoder, channel: None, video: None };
 
     loop {
-        let deadline = loop {
-            match rtc.poll_output()? {
-                Output::Timeout(at) => break at,
-                Output::Transmit(t) => {
-                    if let Some(s) = sockets.iter().find(|s| s.local_addr().ok() == Some(t.source)) {
-                        let _ = s.send_to(&t.contents, t.destination).await;
-                    }
-                }
-                Output::Event(event) => match event {
-                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => return Ok(()),
-                    Event::Connected => tracing::info!("WebRTC connected"),
-                    Event::ChannelOpen(id, _label) => channel = Some(id),
-                    Event::MediaAdded(media) => video = Some(media.mid),
-                    Event::MediaData(data) => decoder.push(data.data.clone(), data.contiguous, data.is_keyframe()),
-                    _ => {}
-                },
-            }
-        };
+        let Some(deadline) = conn.poll().await? else { return Ok(()) };
         tokio::select! {
-            Some((contents, source, destination)) = packets.recv() => {
-                let input = Input::Receive(
-                    Instant::now(),
-                    Receive { proto: Protocol::Udp, source, destination, contents: contents.as_slice().try_into()? },
-                );
-                if rtc.accepts(&input) {
-                    rtc.handle_input(input)?;
-                }
-            }
-            _ = tokio::time::sleep_until(deadline.into()) => rtc.handle_input(Input::Timeout(Instant::now()))?,
-            Some(()) = keyframe_requests.recv() => {
-                if let Some(mut writer) = video.and_then(|mid| rtc.writer(mid)) {
-                    let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
-                }
-            }
+            Some(packet) = packets.recv() => conn.receive(packet)?,
+            _ = tokio::time::sleep_until(deadline.into()) => conn.rtc.handle_input(Input::Timeout(Instant::now()))?,
+            Some(()) = keyframe_requests.recv() => conn.request_keyframe(),
             command = commands.recv() => match command {
-                Some(Command::Send(message)) => {
-                    if let Some(mut ch) = channel.and_then(|id| rtc.channel(id)) {
-                        let _ = ch.write(false, serde_json::to_string(&message)?.as_bytes());
-                    }
-                }
-                Some(Command::Close) | None => {
-                    // Flush what's queued (e.g. a "replaced" message) before closing.
-                    let flush_until = Instant::now() + std::time::Duration::from_millis(200);
-                    while Instant::now() < flush_until {
-                        match rtc.poll_output()? {
-                            Output::Transmit(t) => {
-                                if let Some(s) = sockets.iter().find(|s| s.local_addr().ok() == Some(t.source)) {
-                                    let _ = s.send_to(&t.contents, t.destination).await;
-                                }
-                            }
-                            Output::Timeout(_) => break,
-                            Output::Event(_) => {}
-                        }
-                    }
-                    rtc.disconnect();
-                    return Ok(());
-                }
+                Some(Command::Send(message)) => conn.send(&message)?,
+                Some(Command::Close) | None => return conn.close().await,
             },
         }
-        if !rtc.is_alive() {
+        if !conn.rtc.is_alive() {
             return Ok(());
         }
+    }
+}
+
+/// A datagram: (contents, source, destination).
+type Packet = (Vec<u8>, SocketAddr, SocketAddr);
+
+/// Forward the datagrams arriving on `socket` to `tx`.
+async fn read_socket(socket: Arc<UdpSocket>, tx: mpsc::Sender<Packet>) {
+    let local = socket.local_addr().expect("bound socket");
+    let mut buf = vec![0u8; 2000];
+    while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+        if tx.send((buf[..n].to_vec(), from, local)).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The state of a running session's network loop.
+struct Connection {
+    rtc: Rtc,
+    sockets: Vec<Arc<UdpSocket>>,
+    decoder: DecoderThread,
+    channel: Option<ChannelId>,
+    video: Option<Mid>,
+}
+
+impl Connection {
+    /// Handle str0m's output until it has to wait. Returns when to wake it up, or None
+    /// once the phone disconnected.
+    async fn poll(&mut self) -> Result<Option<Instant>> {
+        loop {
+            match self.rtc.poll_output()? {
+                Output::Timeout(at) => return Ok(Some(at)),
+                Output::Transmit(t) => self.transmit(t).await,
+                Output::Event(event) => {
+                    if !self.on_event(event) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// False if the event ends the session.
+    fn on_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected) => return false,
+            Event::Connected => tracing::info!("WebRTC connected"),
+            Event::ChannelOpen(id, _label) => self.channel = Some(id),
+            Event::MediaAdded(media) => self.video = Some(media.mid),
+            Event::MediaData(data) => self.decoder.push(data.data.clone(), data.contiguous, data.is_keyframe()),
+            _ => {}
+        }
+        true
+    }
+
+    async fn transmit(&self, t: Transmit) {
+        if let Some(s) = self.sockets.iter().find(|s| s.local_addr().ok() == Some(t.source)) {
+            let _ = s.send_to(&t.contents, t.destination).await;
+        }
+    }
+
+    fn receive(&mut self, (contents, source, destination): Packet) -> Result<()> {
+        let receive = Receive { proto: Protocol::Udp, source, destination, contents: contents.as_slice().try_into()? };
+        let input = Input::Receive(Instant::now(), receive);
+        if self.rtc.accepts(&input) {
+            self.rtc.handle_input(input)?;
+        }
+        Ok(())
+    }
+
+    fn request_keyframe(&mut self) {
+        if let Some(mut writer) = self.video.and_then(|mid| self.rtc.writer(mid)) {
+            let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
+        }
+    }
+
+    fn send(&mut self, message: &ServerMessage) -> Result<()> {
+        if let Some(mut ch) = self.channel.and_then(|id| self.rtc.channel(id)) {
+            let _ = ch.write(false, serde_json::to_string(message)?.as_bytes());
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        // Flush what's queued (e.g. a "replaced" message) before closing.
+        let flush_until = Instant::now() + std::time::Duration::from_millis(200);
+        while Instant::now() < flush_until {
+            match self.rtc.poll_output()? {
+                Output::Transmit(t) => self.transmit(t).await,
+                Output::Timeout(_) => break,
+                Output::Event(_) => {}
+            }
+        }
+        self.rtc.disconnect();
+        Ok(())
     }
 }
 
@@ -263,42 +321,52 @@ struct DecoderThread {
 
 impl DecoderThread {
     fn spawn(hub: Arc<FrameHub>, keyframe_requests: mpsc::UnboundedSender<()>) -> Result<Self> {
-        let mut decoder = decode::new_decoder()?;
+        let decoder = decode::new_decoder()?;
         let (frames, rx) = std_mpsc::channel::<Encoded>();
         let backlog = Arc::new(AtomicUsize::new(0));
         let pending = backlog.clone();
-        std::thread::Builder::new().name("h264-decoder".into()).spawn(move || {
-            // After a gap or when we fall behind, frames are useless until a keyframe.
-            let mut need_keyframe = false;
-            while let Ok(Encoded { data, contiguous, keyframe }) = rx.recv() {
-                let behind = pending.fetch_sub(1, Ordering::Relaxed) > MAX_BACKLOG;
-                if !contiguous || behind {
-                    if !need_keyframe {
-                        let _ = keyframe_requests.send(());
-                    }
-                    need_keyframe = true;
-                }
-                if need_keyframe {
-                    if !keyframe {
-                        continue;
-                    }
-                    need_keyframe = false;
-                }
-                let bytes = data.len();
-                if let Err(err) = decoder.decode(&data, &mut |picture| hub.push_yuv(picture, bytes)) {
-                    tracing::debug!("decode error: {err:#}");
-                    hub.count_decode_error();
-                    need_keyframe = true;
-                    let _ = keyframe_requests.send(());
-                }
-            }
-        })?;
+        let decode_frames = move || decode_loop(decoder, rx, &pending, &hub, &keyframe_requests);
+        std::thread::Builder::new().name("h264-decoder".into()).spawn(decode_frames)?;
         Ok(Self { frames, backlog })
     }
 
     fn push(&self, data: Arc<[u8]>, contiguous: bool, keyframe: bool) {
         self.backlog.fetch_add(1, Ordering::Relaxed);
         let _ = self.frames.send(Encoded { data, contiguous, keyframe });
+    }
+}
+
+/// Body of the decoder thread.
+fn decode_loop(
+    mut decoder: Box<dyn decode::VideoDecoder>,
+    rx: std_mpsc::Receiver<Encoded>,
+    pending: &AtomicUsize,
+    hub: &FrameHub,
+    keyframe_requests: &mpsc::UnboundedSender<()>,
+) {
+    // After a gap or when we fall behind, frames are useless until a keyframe.
+    let mut need_keyframe = false;
+    while let Ok(Encoded { data, contiguous, keyframe }) = rx.recv() {
+        let behind = pending.fetch_sub(1, Ordering::Relaxed) > MAX_BACKLOG;
+        if !contiguous || behind {
+            if !need_keyframe {
+                let _ = keyframe_requests.send(());
+            }
+            need_keyframe = true;
+        }
+        if need_keyframe {
+            if !keyframe {
+                continue;
+            }
+            need_keyframe = false;
+        }
+        let bytes = data.len();
+        if let Err(err) = decoder.decode(&data, &mut |picture| hub.push_yuv(picture, bytes)) {
+            tracing::debug!("decode error: {err:#}");
+            hub.count_decode_error();
+            need_keyframe = true;
+            let _ = keyframe_requests.send(());
+        }
     }
 }
 

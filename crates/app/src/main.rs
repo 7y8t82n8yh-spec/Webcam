@@ -70,13 +70,17 @@ enum Cmd {
 }
 
 fn default_data_dir() -> PathBuf {
-    match std::env::var_os("APPDATA") {
-        Some(appdata) => PathBuf::from(appdata).join("iPhoneWebcam"),
-        None => std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".config"))
-            .join("iphone-webcam"),
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata).join("iPhoneWebcam");
     }
+    let config = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join(".config")
+        }
+    };
+    config.join("iphone-webcam")
 }
 
 fn print_banner(app: &App) {
@@ -101,19 +105,20 @@ fn print_banner(app: &App) {
 fn main() -> Result<()> {
     let args = Args::parse();
     let filter = if args.verbose { "debug,str0m=info" } else { "info,str0m=warn" };
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
     anyhow::ensure!(args.width % 2 == 0 && args.height % 2 == 0, "width and height must be even");
 
     match args.command {
         #[cfg(windows)]
         Some(Cmd::Install { dll }) => {
-            std::process::exit(pause_on_error(args.pause_on_error, iphone_webcam::install::install(args.port, dll))?)
+            let result = iphone_webcam::install::install(args.port, dll);
+            std::process::exit(pause_on_error(args.pause_on_error, result)?)
         }
         #[cfg(windows)]
         Some(Cmd::Uninstall) => {
-            std::process::exit(pause_on_error(args.pause_on_error, iphone_webcam::install::uninstall())?)
+            let result = iphone_webcam::install::uninstall();
+            std::process::exit(pause_on_error(args.pause_on_error, result)?)
         }
         #[cfg(target_os = "linux")]
         Some(Cmd::Install { .. }) => std::process::exit(iphone_webcam::install::install(args.port, &args.camera_name)?),
@@ -162,11 +167,11 @@ fn pause_on_error(pause: bool, result: Result<i32>) -> Result<i32> {
 
 /// Ctrl+C (and console close) -> message on `tx`.
 fn ctrlc_channel(tx: std::sync::mpsc::Sender<()>) {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(async {
-            let _ = tokio::signal::ctrl_c().await;
-        });
-        let _ = tx.send(());
-    });
+    std::thread::spawn(move || wait_for_ctrlc(tx));
+}
+
+fn wait_for_ctrlc(tx: std::sync::mpsc::Sender<()>) {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _ = runtime.block_on(tokio::signal::ctrl_c());
+    let _ = tx.send(());
 }

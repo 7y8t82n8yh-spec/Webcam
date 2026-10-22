@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use ab_glyph::{Font, FontRef, OutlinedGlyph, PxScale, ScaleFont};
 
 /// After this long without a frame from the phone, show the placeholder again.
 pub const STALE_AFTER: Duration = Duration::from_secs(3);
@@ -183,10 +183,11 @@ fn decode_jpeg(data: &[u8], w: u32, h: u32, mode: FitMode) -> anyhow::Result<(Fr
     let (sw, sh) = decoder.dimensions().ok_or_else(|| anyhow::anyhow!("no dimensions"))?;
     let (sw, sh) = (sw as u32, sh as u32);
     anyhow::ensure!(pixels.len() == (sw * sh * 3) as usize, "unexpected pixel buffer size");
-    let frame = resample(sw, sh, w, h, mode, |x, y| {
+    let sample = |x: u32, y: u32| {
         let i = ((y * sw + x) * 3) as usize;
         [pixels[i], pixels[i + 1], pixels[i + 2]]
-    });
+    };
+    let frame = resample(sw, sh, w, h, mode, sample);
     Ok((frame, (sw, sh)))
 }
 
@@ -200,7 +201,7 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
 }
 
 pub fn convert_yuv(p: &Yuv420, w: u32, h: u32, mode: FitMode) -> Frame {
-    resample(p.width, p.height, w, h, mode, |x, y| {
+    let sample = |x: u32, y: u32| {
         let luma = p.y[y as usize * p.y_stride + x as usize];
         let (cx, cy) = ((x / 2) as usize, (y / 2) as usize);
         let (u, v) = if p.nv12 {
@@ -210,7 +211,8 @@ pub fn convert_yuv(p: &Yuv420, w: u32, h: u32, mode: FitMode) -> Frame {
             (p.u[cy * p.uv_stride + cx], p.v[cy * p.uv_stride + cx])
         };
         yuv_to_rgb(luma, u, v)
-    })
+    };
+    resample(p.width, p.height, w, h, mode, sample)
 }
 
 /// A dark frame with centred status text, shown while no phone is streaming.
@@ -226,26 +228,34 @@ pub fn placeholder(w: u32, h: u32, lines: &[&str]) -> Frame {
         let width: f32 = line.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum();
         let mut x = (w as f32 - width) / 2.0;
         for c in line.chars() {
-            let glyph = font.glyph_id(c).with_scale_and_position(scale, ab_glyph::point(x, baseline));
-            x += scaled.h_advance(font.glyph_id(c));
+            let id = font.glyph_id(c);
+            let glyph = id.with_scale_and_position(scale, ab_glyph::point(x, baseline));
+            x += scaled.h_advance(id);
             if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                outlined.draw(|gx, gy, coverage| {
-                    let (px, py) = (bounds.min.x as i64 + gx as i64, bounds.min.y as i64 + gy as i64);
-                    if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
-                        return;
-                    }
-                    let i = ((py as u32 * w + px as u32) * 3) as usize;
-                    for (k, target) in [220u8, 220, 225].iter().enumerate() {
-                        let bg = frame.rgb[i + k] as f32;
-                        frame.rgb[i + k] = (bg + (*target as f32 - bg) * coverage) as u8;
-                    }
-                });
+                draw_glyph(&mut frame, &outlined);
             }
         }
         baseline += line_height;
     }
     frame
+}
+
+/// Blend a light glyph into `frame`, clipped to its bounds.
+fn draw_glyph(frame: &mut Frame, outlined: &OutlinedGlyph) {
+    let bounds = outlined.px_bounds();
+    let (w, h) = (frame.width, frame.height);
+    let blend = |gx: u32, gy: u32, coverage: f32| {
+        let (px, py) = (bounds.min.x as i64 + gx as i64, bounds.min.y as i64 + gy as i64);
+        if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
+            return;
+        }
+        let i = ((py as u32 * w + px as u32) * 3) as usize;
+        for (k, target) in [220u8, 220, 225].iter().enumerate() {
+            let bg = frame.rgb[i + k] as f32;
+            frame.rgb[i + k] = (bg + (*target as f32 - bg) * coverage) as u8;
+        }
+    };
+    outlined.draw(blend);
 }
 
 #[cfg(test)]

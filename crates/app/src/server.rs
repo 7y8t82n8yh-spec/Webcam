@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientInfo, ClientMessage, OfferRequest, OfferResponse, ServerMessage, StreamConfig};
 use serde::Deserialize;
@@ -48,6 +49,8 @@ enum Conn {
     Rtc(RtcSession),
     Http,
 }
+
+type WsSender = SplitSink<WebSocket, Message>;
 
 enum WsCommand {
     Replaced,
@@ -133,13 +136,8 @@ impl Server {
             .route("/status", get(status))
             .route_layer(middleware::from_fn_with_state(self.clone(), check_key));
         Router::new()
-            .route("/", get(|| async { web_assets::serve("index.html") }))
-            .route(
-                "/pkg/{file}",
-                get(|axum::extract::Path(file): axum::extract::Path<String>| async move {
-                    web_assets::serve(&format!("pkg/{file}"))
-                }),
-            )
+            .route("/", get(index))
+            .route("/pkg/{file}", get(pkg_file))
             .route("/config", get(config))
             .route("/ca.crt", get(ca_cert))
             .merge(protected)
@@ -148,17 +146,29 @@ impl Server {
     }
 }
 
+async fn index() -> Response {
+    web_assets::serve("index.html")
+}
+
+async fn pkg_file(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
+    web_assets::serve(&format!("pkg/{file}"))
+}
+
 /// Endpoints that carry camera images need the pairing key from the QR code, so other
 /// devices on the network can neither watch nor inject video.
 async fn check_key(State(server): State<Arc<Server>>, request: Request, next: Next) -> Response {
-    let from_query =
-        request.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("k="))).map(|k| k.to_string());
+    let from_query = request.uri().query().and_then(key_param).map(str::to_string);
     let from_header = request.headers().get(protocol::KEY_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
     let given = from_query.or(from_header).unwrap_or_default();
     if !constant_time_eq(given.as_bytes(), server.key.as_bytes()) {
         return (StatusCode::FORBIDDEN, "missing or wrong pairing key - scan the QR code again").into_response();
     }
     next.run(request).await
+}
+
+/// The value of `k=` in a query string.
+fn key_param(query: &str) -> Option<&str> {
+    query.split('&').find_map(|kv| kv.strip_prefix("k="))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -238,9 +248,13 @@ async fn frame_post(State(server): State<Arc<Server>>, headers: HeaderMap, body:
     if !is_active {
         server.take_over(&client, Conn::Http);
     }
-    let hub = server.hub.clone();
-    let ok = tokio::task::spawn_blocking(move || hub.push_jpeg(&body, "JPEG")).await.unwrap_or(false);
+    let ok = push_jpeg(server.hub.clone(), body).await;
     Json(serde_json::json!({ "ok": ok })).into_response()
+}
+
+/// Decode a fallback JPEG off the async threads.
+async fn push_jpeg(hub: Arc<FrameHub>, data: Bytes) -> bool {
+    tokio::task::spawn_blocking(move || hub.push_jpeg(&data, "JPEG")).await.unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -266,38 +280,50 @@ async fn handle_socket(server: Arc<Server>, client: String, socket: WebSocket) {
         return;
     }
     loop {
-        tokio::select! {
-            message = rx.next() => match message {
-                Some(Ok(Message::Binary(data))) => {
-                    let hub = server.hub.clone();
-                    let ok = tokio::task::spawn_blocking(move || hub.push_jpeg(&data, "JPEG")).await.unwrap_or(false);
-                    let reply = if ok { protocol::ACK } else { protocol::BAD };
-                    if tx.send(Message::Text(reply.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(ClientMessage::Hello(info)) = serde_json::from_str(&text) {
-                        tracing::info!("Phone info: {info:?}");
-                        *server.client_info.lock().unwrap() = info;
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
-            },
-            command = command_rx.recv() => match command {
-                Some(WsCommand::Replaced) => {
-                    let msg = serde_json::to_string(&ServerMessage::Replaced).unwrap();
-                    let _ = tx.send(Message::Text(msg.into())).await;
-                }
-                Some(WsCommand::Close) | None => {
-                    let _ = tx.send(Message::Close(None)).await;
-                    break;
-                }
-            },
+        let keep_going = tokio::select! {
+            message = rx.next() => on_ws_message(&server, &mut tx, message).await,
+            command = command_rx.recv() => on_ws_command(&mut tx, command).await,
+        };
+        if !keep_going {
+            break;
         }
     }
     server.ended(id);
+}
+
+/// Handle a message from the phone; false ends the connection.
+async fn on_ws_message(server: &Server, tx: &mut WsSender, message: Option<Result<Message, axum::Error>>) -> bool {
+    match message {
+        Some(Ok(Message::Binary(data))) => {
+            let ok = push_jpeg(server.hub.clone(), data).await;
+            let reply = if ok { protocol::ACK } else { protocol::BAD };
+            tx.send(Message::Text(reply.into())).await.is_ok()
+        }
+        Some(Ok(Message::Text(text))) => {
+            if let Ok(ClientMessage::Hello(info)) = serde_json::from_str(&text) {
+                tracing::info!("Phone info: {info:?}");
+                *server.client_info.lock().unwrap() = info;
+            }
+            true
+        }
+        Some(Ok(_)) => true,
+        Some(Err(_)) | None => false,
+    }
+}
+
+/// Carry out a command for the connection; false ends it.
+async fn on_ws_command(tx: &mut WsSender, command: Option<WsCommand>) -> bool {
+    match command {
+        Some(WsCommand::Replaced) => {
+            let msg = serde_json::to_string(&ServerMessage::Replaced).unwrap();
+            let _ = tx.send(Message::Text(msg.into())).await;
+            true
+        }
+        Some(WsCommand::Close) | None => {
+            let _ = tx.send(Message::Close(None)).await;
+            false
+        }
+    }
 }
 
 /// Serve `router` over HTTPS until `shutdown` resolves.
@@ -312,12 +338,14 @@ pub async fn serve(
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
     let handle = axum_server::Handle::new();
     let h = handle.clone();
-    tokio::spawn(async move {
+    let stop_on_shutdown = async move {
         shutdown.await;
         h.graceful_shutdown(Some(std::time::Duration::from_secs(1)));
-    });
+    };
+    tokio::spawn(stop_on_shutdown);
     let server = axum_server::bind_rustls(addr, tls).handle(handle.clone());
-    let serving = tokio::spawn(server.serve(router.into_make_service()));
+    let service = router.into_make_service();
+    let serving = tokio::spawn(server.serve(service));
     if let Some(bound) = handle.listening().await {
         started(bound);
     }
