@@ -326,29 +326,23 @@ async fn on_ws_command(tx: &mut WsSender, command: Option<WsCommand>) -> bool {
     }
 }
 
-/// Serve `router` over HTTPS until `shutdown` resolves.
-pub async fn serve(
-    router: Router,
-    addr: SocketAddr,
+/// Serve the page and API over HTTPS on `listener` until `handle` shuts it down. Runs
+/// on its own thread, with its own async runtime.
+pub fn run(
+    server: Arc<Server>,
+    listener: std::net::TcpListener,
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    started: impl FnOnce(SocketAddr) + Send,
-) -> anyhow::Result<()> {
-    let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
-    let handle = axum_server::Handle::new();
-    let h = handle.clone();
-    let stop_on_shutdown = async move {
-        shutdown.await;
-        h.graceful_shutdown(Some(std::time::Duration::from_secs(1)));
+    handle: axum_server::Handle<SocketAddr>,
+) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let serving = async {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+        let service = server.router().into_make_service();
+        axum_server::from_tcp_rustls(listener, tls)?.handle(handle).serve(service).await?;
+        anyhow::Ok(())
     };
-    tokio::spawn(stop_on_shutdown);
-    let server = axum_server::bind_rustls(addr, tls).handle(handle.clone());
-    let service = router.into_make_service();
-    let serving = tokio::spawn(server.serve(service));
-    if let Some(bound) = handle.listening().await {
-        started(bound);
+    if let Err(err) = runtime.block_on(serving) {
+        tracing::error!("server stopped: {err:#}");
     }
-    serving.await??;
-    Ok(())
 }

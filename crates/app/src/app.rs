@@ -1,14 +1,13 @@
 //! Wires the certificates, server, frame hub and virtual camera output together.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use protocol::StreamConfig;
-use tokio::sync::oneshot;
 
 use crate::camera::{self, CameraSink};
 use crate::hub::{FitMode, FrameHub};
@@ -37,7 +36,7 @@ pub struct App {
     pub bound: SocketAddr,
     /// What the virtual camera is doing, for display.
     pub camera_status: Arc<Mutex<String>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    server_handle: axum_server::Handle<SocketAddr>,
     server_thread: Option<JoinHandle<()>>,
     camera_thread: Option<camera::OutputThread>,
 }
@@ -56,41 +55,6 @@ pub fn load_or_create_key(dir: &Path) -> Result<String> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(&path, &key)?;
     Ok(key)
-}
-
-/// Body of the server thread: serve until `shutdown` fires, reporting the bound address
-/// (or why it couldn't listen) on `bound_tx`.
-fn run_server(
-    server: Arc<Server>,
-    addr: SocketAddr,
-    cert: Vec<u8>,
-    cert_key: Vec<u8>,
-    shutdown: oneshot::Receiver<()>,
-    bound_tx: std::sync::mpsc::Sender<Result<SocketAddr, String>>,
-) {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let router = server.clone().router();
-    let bound_ok = bound_tx.clone();
-    let on_shutdown = async move {
-        let _ = shutdown.await;
-        server.shutdown();
-    };
-    let on_bound = move |bound| {
-        let _ = bound_ok.send(Ok(bound));
-    };
-    let serving = server::serve(router, addr, cert, cert_key, on_shutdown, on_bound);
-    if let Err(err) = runtime.block_on(serving) {
-        let _ = bound_tx.send(Err(format!("{err:#}")));
-    }
-}
-
-/// The page URLs to show, one per LAN address (localhost if there is none).
-fn pairing_urls(ips: &[IpAddr], port: u16, key: &str) -> Vec<String> {
-    let mut url_ips = ips.to_vec();
-    if url_ips.is_empty() {
-        url_ips.push(IpAddr::from([127, 0, 0, 1]));
-    }
-    url_ips.iter().map(|ip| format!("https://{ip}:{port}/?k={key}")).collect()
 }
 
 /// Open the virtual camera unless it's disabled, recording the outcome in `status`.
@@ -131,19 +95,21 @@ impl App {
         };
         let server = Arc::new(Server::new(hub.clone(), key.clone(), config, ips.clone(), certs.ca_cert_der.clone()));
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (bound_tx, bound_rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
+        // Bound here, so a busy port is reported right away (and port 0 gets its number).
         let addr = SocketAddr::new(settings.host, settings.port);
-        let (cert, cert_key) = (certs.server_cert_pem, certs.server_key_pem);
-        let server_for_thread = server.clone();
-        let serve = move || run_server(server_for_thread, addr, cert, cert_key, shutdown_rx, bound_tx);
+        let listener = TcpListener::bind(addr).with_context(|| format!("could not listen on {addr}"))?;
+        listener.set_nonblocking(true)?;
+        let bound = listener.local_addr()?;
+        let server_handle = axum_server::Handle::new();
+        let serve = {
+            let (server, handle) = (server.clone(), server_handle.clone());
+            move || server::run(server, listener, certs.server_cert_pem, certs.server_key_pem, handle)
+        };
         let server_thread = std::thread::Builder::new().name("server".into()).spawn(serve)?;
-        let bound = bound_rx
-            .recv_timeout(Duration::from_secs(10))
-            .context("server did not start")?
-            .map_err(|e| anyhow::anyhow!("could not listen on {addr}: {e}"))?;
 
-        let urls = pairing_urls(&ips, bound.port(), &key);
+        // One URL per LAN address; localhost if there is none.
+        let url_ips = if ips.is_empty() { vec![IpAddr::from([127, 0, 0, 1])] } else { ips.clone() };
+        let urls = url_ips.iter().map(|ip| format!("https://{ip}:{}/?k={key}", bound.port())).collect();
 
         let camera_status = Arc::new(Mutex::new(String::from("not started")));
         let sink = open_camera(&settings, &camera_status);
@@ -156,7 +122,7 @@ impl App {
             settings,
             bound,
             camera_status,
-            shutdown: Some(shutdown_tx),
+            server_handle,
             server_thread: Some(server_thread),
             camera_thread: Some(camera_thread),
         })
@@ -167,17 +133,14 @@ impl App {
     }
 
     pub fn stop(&mut self) {
-        let started = Instant::now();
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
+        self.server.shutdown(); // ends the phone's connection
+        self.server_handle.graceful_shutdown(Some(Duration::from_secs(1)));
         if let Some(camera) = self.camera_thread.take() {
             camera.stop();
         }
         if let Some(thread) = self.server_thread.take() {
             let _ = thread.join();
         }
-        tracing::debug!("stopped in {:?}", started.elapsed());
     }
 }
 
