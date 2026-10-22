@@ -33,7 +33,6 @@ enum Command {
 /// Handle to a running session; dropping it does not stop the session.
 pub struct RtcSession {
     pub id: u64,
-    pub client_id: String,
     commands: mpsc::UnboundedSender<Command>,
 }
 
@@ -75,14 +74,16 @@ fn rtc_config() -> RtcConfig {
     config
 }
 
-/// Accept `offer_sdp` and start receiving. Returns the SDP answer.
+/// Accept `offer_sdp` and start receiving. Returns the SDP answer; `on_end` runs when
+/// the session ends.
 pub async fn start(
+    id: u64,
     offer_sdp: &str,
     client_id: String,
     ips: &[IpAddr],
     hub: Arc<FrameHub>,
     start_bitrate: u32,
-    on_end: impl FnOnce(u64) + Send + 'static,
+    on_end: impl FnOnce() + Send + 'static,
 ) -> Result<(String, RtcSession)> {
     let offer = SdpOffer::from_sdp_string(offer_sdp).context("invalid SDP offer")?;
     let mut rtc = rtc_config().build(Instant::now());
@@ -93,17 +94,15 @@ pub async fn start(
     let answer = rtc.sdp_api().accept_offer(offer).context("offer not acceptable (no H.264?)")?;
     let answer = with_start_bitrate(&answer.to_sdp_string(), start_bitrate / 1000);
 
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) as u64;
     let (commands, command_rx) = mpsc::unbounded_channel();
-    let session = RtcSession { id, client_id: client_id.clone(), commands };
+    let session = RtcSession { id, commands };
     let session_task = async move {
         if let Err(err) = run(rtc, sockets, command_rx, hub).await {
             tracing::warn!("WebRTC session {client_id} ended: {err:#}");
         } else {
             tracing::info!("WebRTC session {client_id} ended");
         }
-        on_end(id);
+        on_end();
     };
     tokio::spawn(session_task);
     Ok((answer, session))
@@ -311,7 +310,7 @@ fn decode_loop(
             }
             need_keyframe = false;
         }
-        if let Err(err) = decoder.decode(&data, |picture| hub.push_yuv(picture, data.len())) {
+        if let Err(err) = decoder.decode(&data, |picture| hub.push_yuv(picture)) {
             tracing::debug!("decode error: {err:#}");
             hub.count_decode_error();
             need_keyframe = true;

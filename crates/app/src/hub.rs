@@ -45,7 +45,6 @@ pub struct Yuv420<'a> {
 pub struct Stats {
     pub frames_in: u64,
     pub frames_out: u64,
-    pub bytes_in: u64,
     pub decode_errors: u64,
     pub source_size: (u32, u32),
     pub transport: &'static str,
@@ -62,7 +61,7 @@ struct State {
 pub struct FrameHub {
     pub width: u32,
     pub height: u32,
-    pub mode: FitMode,
+    mode: FitMode,
     state: Mutex<State>,
 }
 
@@ -82,21 +81,20 @@ impl FrameHub {
         self.state.lock().unwrap().placeholder = frame;
     }
 
-    fn store(&self, frame: Frame, source: (u32, u32), bytes: usize, transport: &'static str) {
+    fn store(&self, frame: Frame, source: (u32, u32), transport: &'static str) {
         let mut s = self.state.lock().unwrap();
         s.frame = Some(Arc::new(frame));
         s.last_frame = Some(Instant::now());
         s.stats.frames_in += 1;
-        s.stats.bytes_in += bytes as u64;
         s.stats.source_size = source;
         s.stats.transport = transport;
     }
 
-    /// Decode a JPEG from the fallback transport. Returns false if it isn't one.
-    pub fn push_jpeg(&self, data: &[u8], transport: &'static str) -> bool {
+    /// Decode a JPEG from the fallback transports. Returns false if it isn't one.
+    pub fn push_jpeg(&self, data: &[u8]) -> bool {
         match decode_jpeg(data, self.width, self.height, self.mode) {
             Ok((frame, source)) => {
-                self.store(frame, source, data.len(), transport);
+                self.store(frame, source, "JPEG");
                 true
             }
             Err(err) => {
@@ -108,9 +106,9 @@ impl FrameHub {
     }
 
     /// Store a decoded WebRTC picture.
-    pub fn push_yuv(&self, picture: &Yuv420, bytes: usize) {
+    pub fn push_yuv(&self, picture: &Yuv420) {
         let frame = convert_yuv(picture, self.width, self.height, self.mode);
-        self.store(frame, (picture.width, picture.height), bytes, "WebRTC");
+        self.store(frame, (picture.width, picture.height), "WebRTC");
     }
 
     pub fn count_decode_error(&self) {
@@ -140,7 +138,7 @@ impl FrameHub {
 }
 
 /// Size to scale a `sw x sh` picture to so it fits (or fills) `w x h`.
-pub fn scaled_size(sw: u32, sh: u32, w: u32, h: u32, mode: FitMode) -> (u32, u32) {
+fn scaled_size(sw: u32, sh: u32, w: u32, h: u32, mode: FitMode) -> (u32, u32) {
     let (sx, sy) = (w as f64 / sw as f64, h as f64 / sh as f64);
     let scale = match mode {
         FitMode::Fit => sx.min(sy),
@@ -198,7 +196,7 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     [clamp(c + 409 * e), clamp(c - 100 * d - 208 * e), clamp(c + 516 * d)]
 }
 
-pub fn convert_yuv(p: &Yuv420, w: u32, h: u32, mode: FitMode) -> Frame {
+fn convert_yuv(p: &Yuv420, w: u32, h: u32, mode: FitMode) -> Frame {
     let sample = |x: u32, y: u32| {
         let luma = p.y[y as usize * p.y_stride + x as usize];
         let chroma = (y / 2) as usize * p.uv_stride + (x / 2) as usize;
@@ -284,10 +282,10 @@ mod tests {
     fn small_frames_are_upscaled_and_garbage_rejected() {
         let hub = FrameHub::new(1280, 720, FitMode::Fit);
         let placeholder = hub.latest();
-        assert!(!hub.push_jpeg(b"not a jpeg", "JPEG"));
+        assert!(!hub.push_jpeg(b"not a jpeg"));
         assert_eq!(hub.stats().decode_errors, 1);
         assert!(Arc::ptr_eq(&hub.latest(), &placeholder));
-        assert!(hub.push_jpeg(&solid_jpeg(640, 360, [10, 200, 10]), "JPEG"));
+        assert!(hub.push_jpeg(&solid_jpeg(640, 360, [10, 200, 10])));
         assert!(hub.streaming());
         let frame = hub.latest();
         assert_eq!((frame.width, frame.height), (1280, 720));

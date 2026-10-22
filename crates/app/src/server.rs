@@ -61,7 +61,7 @@ impl Conn {
     fn id(&self) -> Option<u64> {
         match self {
             Conn::Ws { id, .. } => Some(*id),
-            Conn::Rtc(session) => Some(session.id + (1 << 62)), // separate id spaces
+            Conn::Rtc(session) => Some(session.id),
             Conn::Http => None,
         }
     }
@@ -154,6 +154,12 @@ async fn pkg_file(axum::extract::Path(file): axum::extract::Path<String>) -> Res
     web_assets::serve(&format!("pkg/{file}"))
 }
 
+/// Identifies a connection, so a late "ended" from a replaced one is ignored.
+fn next_connection_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Endpoints that carry camera images need the pairing key from the QR code, so other
 /// devices on the network can neither watch nor inject video.
 async fn check_key(State(server): State<Arc<Server>>, request: Request, next: Next) -> Response {
@@ -209,13 +215,15 @@ async fn status(State(server): State<Arc<Server>>) -> Response {
 /// WebRTC signalling: take the phone's offer, return our answer plus settings.
 async fn offer(State(server): State<Arc<Server>>, Json(request): Json<OfferRequest>) -> Response {
     *server.client_info.lock().unwrap() = request.info.clone();
+    let id = next_connection_id();
     let weak = Arc::downgrade(&server);
-    let on_end = move |id: u64| {
+    let on_end = move || {
         if let Some(server) = weak.upgrade() {
-            server.ended(id + (1 << 62));
+            server.ended(id);
         }
     };
     let started = webrtc::start(
+        id,
         &request.sdp,
         request.id.clone(),
         &server.ips,
@@ -254,7 +262,7 @@ async fn frame_post(State(server): State<Arc<Server>>, headers: HeaderMap, body:
 
 /// Decode a fallback JPEG off the async threads.
 async fn push_jpeg(hub: Arc<FrameHub>, data: Bytes) -> bool {
-    tokio::task::spawn_blocking(move || hub.push_jpeg(&data, "JPEG")).await.unwrap_or(false)
+    tokio::task::spawn_blocking(move || hub.push_jpeg(&data)).await.unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -268,8 +276,7 @@ async fn websocket(State(server): State<Arc<Server>>, Query(query): Query<WsQuer
 }
 
 async fn handle_socket(server: Arc<Server>, client: String, socket: WebSocket) {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let id = next_connection_id();
     let (commands, mut command_rx) = mpsc::unbounded_channel();
     server.take_over(&client, Conn::Ws { id, commands });
 
