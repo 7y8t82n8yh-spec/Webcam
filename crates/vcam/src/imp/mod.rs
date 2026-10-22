@@ -2,6 +2,7 @@
 //! optional diagnostic log. `iphone-webcam install` registers the class.
 
 mod activate;
+mod events;
 mod frames;
 mod source;
 

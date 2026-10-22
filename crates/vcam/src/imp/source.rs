@@ -6,12 +6,13 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use windows::core::{implement, Interface, GUID, HRESULT};
-use windows::Win32::Foundation::{ERROR_SET_NOT_FOUND, E_INVALIDARG, E_POINTER, S_OK};
+use windows::Win32::Foundation::{ERROR_SET_NOT_FOUND, E_INVALIDARG, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows_core::{ComObject, IUnknown, Ref};
 
+use super::events::EventQueue;
 use super::frames::FrameReader;
 use super::vlog;
 use crate::convert;
@@ -59,7 +60,7 @@ struct Shared {
 }
 
 struct StreamInner {
-    queue: Option<IMFMediaEventQueue>,
+    queue: Option<EventQueue>,
     descriptor: Option<IMFStreamDescriptor>,
     state: MF_STREAM_STATE,
     requests: VecDeque<Option<IUnknown>>,
@@ -80,7 +81,7 @@ pub struct Stream {
 
 impl Stream {
     fn new(descriptor: IMFStreamDescriptor) -> windows::core::Result<Self> {
-        let queue = unsafe { MFCreateEventQueue()? };
+        let queue = EventQueue::new()?;
         let inner = StreamInner {
             queue: Some(queue),
             descriptor: Some(descriptor),
@@ -101,7 +102,7 @@ impl Stream {
         let mut inner = lock(&self.shared.inner);
         let queue = inner.queue.clone().ok_or_else(shutdown_error)?;
         inner.state = MF_STREAM_STATE_RUNNING;
-        unsafe { queue.QueueEventParamVar(MEStreamStarted.0 as u32, &GUID::zeroed(), S_OK, start_time) }
+        queue.send(MEStreamStarted, Some(start_time))
     }
 
     fn stop(&self) -> windows::core::Result<()> {
@@ -109,14 +110,14 @@ impl Stream {
         let queue = inner.queue.clone().ok_or_else(shutdown_error)?;
         inner.state = MF_STREAM_STATE_STOPPED;
         inner.requests.clear();
-        unsafe { queue.QueueEventParamVar(MEStreamStopped.0 as u32, &GUID::zeroed(), S_OK, std::ptr::null()) }
+        queue.send(MEStreamStopped, None)
     }
 
     fn shutdown(&self) {
         let mut inner = lock(&self.shared.inner);
         inner.stopping = true;
         if let Some(queue) = inner.queue.take() {
-            let _ = unsafe { queue.Shutdown() };
+            queue.shutdown();
         }
         inner.requests.clear();
         inner.descriptor = None;
@@ -135,7 +136,7 @@ impl Stream {
         }
     }
 
-    fn queue(&self) -> windows::core::Result<IMFMediaEventQueue> {
+    fn queue(&self) -> windows::core::Result<EventQueue> {
         lock(&self.shared.inner).queue.clone().ok_or_else(shutdown_error)
     }
 }
@@ -197,12 +198,10 @@ fn deliver(shared: &Shared, sample: windows::core::Result<IMFSample>) {
         return;
     }
     drop(inner);
-    unsafe {
-        let _ = match sample {
-            Ok(sample) => queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample),
-            Err(e) => queue.QueueEventParamVar(MEError.0 as u32, &GUID::zeroed(), e.code(), std::ptr::null()),
-        };
-    }
+    let _ = match sample {
+        Ok(sample) => queue.send_object(MEMediaSample, &sample),
+        Err(e) => queue.send_error(e.code()),
+    };
 }
 
 /// The next frame, converted to the stream's current format, carrying the request's
@@ -243,14 +242,13 @@ unsafe fn create_sample(
 
 impl IMFMediaEventGenerator_Impl for Stream_Impl {
     fn GetEvent(&self, flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS) -> windows::core::Result<IMFMediaEvent> {
-        let queue = self.queue()?; // may block: not under the lock
-        unsafe { queue.GetEvent(flags.0) }
+        self.queue()?.get_event(flags) // may block: the lock isn't held
     }
     fn BeginGetEvent(&self, callback: Ref<IMFAsyncCallback>, state: Ref<IUnknown>) -> windows::core::Result<()> {
-        unsafe { self.queue()?.BeginGetEvent(callback.as_ref(), state.as_ref()) }
+        self.queue()?.begin_get_event(callback, state)
     }
     fn EndGetEvent(&self, result: Ref<IMFAsyncResult>) -> windows::core::Result<IMFMediaEvent> {
-        unsafe { self.queue()?.EndGetEvent(result.as_ref()) }
+        self.queue()?.end_get_event(result)
     }
     fn QueueEvent(
         &self,
@@ -259,7 +257,8 @@ impl IMFMediaEventGenerator_Impl for Stream_Impl {
         status: HRESULT,
         value: *const PROPVARIANT,
     ) -> windows::core::Result<()> {
-        unsafe { self.queue()?.QueueEventParamVar(met, ext, status, value) }
+        // SAFETY: COM passes valid (or null) pointers.
+        unsafe { self.queue()?.queue_event(met, ext, status, value) }
     }
 }
 
@@ -341,7 +340,7 @@ pub struct Source {
 }
 
 struct SourceInner {
-    queue: Option<IMFMediaEventQueue>,
+    queue: Option<EventQueue>,
     attributes: IMFAttributes,
     presentation: IMFPresentationDescriptor,
     started: bool,
@@ -357,7 +356,7 @@ impl Source {
             MFCreateAttributes(&mut attributes, 1)?;
 
             let stream = ComObject::new(Stream::new(descriptor)?);
-            let queue = MFCreateEventQueue()?;
+            let queue = EventQueue::new()?;
             let attributes = attributes.ok_or(E_POINTER)?;
             let inner = SourceInner { queue: Some(queue), attributes, presentation, started: false };
             let source = ComObject::new(Source { inner: Mutex::new(inner), stream: stream.clone() });
@@ -375,12 +374,12 @@ impl Source {
     pub fn shutdown(&self) {
         vlog!("source Shutdown");
         if let Some(queue) = lock(&self.inner).queue.take() {
-            let _ = unsafe { queue.Shutdown() };
+            queue.shutdown();
         }
         self.stream.shutdown(); // joins its worker: not under our lock
     }
 
-    fn queue(&self) -> windows::core::Result<IMFMediaEventQueue> {
+    fn queue(&self) -> windows::core::Result<EventQueue> {
         lock(&self.inner).queue.clone().ok_or_else(shutdown_error)
     }
 }
@@ -393,14 +392,13 @@ impl Drop for Source {
 
 impl IMFMediaEventGenerator_Impl for Source_Impl {
     fn GetEvent(&self, flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS) -> windows::core::Result<IMFMediaEvent> {
-        let queue = self.queue()?;
-        unsafe { queue.GetEvent(flags.0) }
+        self.queue()?.get_event(flags)
     }
     fn BeginGetEvent(&self, callback: Ref<IMFAsyncCallback>, state: Ref<IUnknown>) -> windows::core::Result<()> {
-        unsafe { self.queue()?.BeginGetEvent(callback.as_ref(), state.as_ref()) }
+        self.queue()?.begin_get_event(callback, state)
     }
     fn EndGetEvent(&self, result: Ref<IMFAsyncResult>) -> windows::core::Result<IMFMediaEvent> {
-        unsafe { self.queue()?.EndGetEvent(result.as_ref()) }
+        self.queue()?.end_get_event(result)
     }
     fn QueueEvent(
         &self,
@@ -409,7 +407,8 @@ impl IMFMediaEventGenerator_Impl for Source_Impl {
         status: HRESULT,
         value: *const PROPVARIANT,
     ) -> windows::core::Result<()> {
-        unsafe { self.queue()?.QueueEventParamVar(met, ext, status, value) }
+        // SAFETY: COM passes valid (or null) pointers.
+        unsafe { self.queue()?.queue_event(met, ext, status, value) }
     }
 }
 
@@ -447,18 +446,18 @@ impl IMFMediaSource_Impl for Source_Impl {
         if selected.as_bool() {
             let event = if inner.started { MEUpdatedStream } else { MENewStream };
             let stream: IMFMediaStream2 = self.stream.to_interface();
-            unsafe { queue.QueueEventParamUnk(event.0 as u32, &GUID::zeroed(), S_OK, &stream)? };
+            queue.send_object(event, &stream)?;
             self.stream.start(&start)?;
             inner.started = true;
         }
-        unsafe { queue.QueueEventParamVar(MESourceStarted.0 as u32, &GUID::zeroed(), S_OK, &start) }
+        queue.send(MESourceStarted, Some(&start))
     }
 
     fn Stop(&self) -> windows::core::Result<()> {
         vlog!("source Stop");
         let queue = self.queue()?;
         self.stream.stop()?;
-        unsafe { queue.QueueEventParamVar(MESourceStopped.0 as u32, &GUID::zeroed(), S_OK, std::ptr::null()) }
+        queue.send(MESourceStopped, None)
     }
 
     fn Pause(&self) -> windows::core::Result<()> {
