@@ -214,7 +214,15 @@ type Packet = (Vec<u8>, SocketAddr, SocketAddr);
 async fn read_socket(socket: Arc<UdpSocket>, tx: mpsc::Sender<Packet>) {
     let local = socket.local_addr().expect("bound socket");
     let mut buf = vec![0u8; 2000];
-    while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+    loop {
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            // Windows reports an ICMP "port unreachable" for an earlier send (e.g. an ICE
+            // check to a candidate that's gone) as an error on the next receive. The
+            // socket is fine; keep reading.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            Err(_) => break,
+        };
         if tx.send((buf[..n].to_vec(), from, local)).await.is_err() {
             break;
         }

@@ -203,6 +203,11 @@ fn send_frame(rtc: &mut Rtc, mid: Mid, encoder: &mut Encoder, yuv: &YUVBuffer, s
 async fn receive_until(rtc: &mut Rtc, socket: &UdpSocket, local: SocketAddr, buf: &mut [u8], until: Instant) {
     tokio::select! {
         received = socket.recv_from(buf) => {
+            // Windows reports ICMP "port unreachable" for an earlier send as an error on
+            // the next receive, e.g. once the app has dropped this phone's session.
+            if matches!(&received, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset) {
+                return;
+            }
             let (n, source) = received.unwrap();
             let contents = buf[..n].try_into().unwrap();
             let receive = Receive { proto: Protocol::Udp, source, destination: local, contents };
