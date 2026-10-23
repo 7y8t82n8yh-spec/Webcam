@@ -62,6 +62,7 @@ impl EventQueue {
         status: HRESULT,
         value: *const PROPVARIANT,
     ) -> Result<()> {
-        self.0.QueueEventParamVar(met, ext, status, value)
+        // SAFETY: the caller guarantees the pointers; the queue is live.
+        unsafe { self.0.QueueEventParamVar(met, ext, status, value) }
     }
 }

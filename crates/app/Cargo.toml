@@ -56,3 +56,6 @@ str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[lints]
+workspace = true

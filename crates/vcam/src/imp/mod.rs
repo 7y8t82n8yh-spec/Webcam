@@ -8,7 +8,7 @@ mod source;
 
 use std::ffi::c_void;
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::core::{implement, Interface, BOOL, GUID, HRESULT};
 use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, S_FALSE};
@@ -17,6 +17,20 @@ use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows_core::Ref;
 
 const CLSID: GUID = GUID::from_u128(protocol::frame_section::VCAM_CLSID_U128);
+
+/// Lock `mutex`, even if a thread panicked while holding it: a camera that keeps going
+/// is better than one that stops for good.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An empty Media Foundation attribute store.
+pub(crate) fn new_attributes() -> windows::core::Result<windows::Win32::Media::MediaFoundation::IMFAttributes> {
+    let mut attributes = None;
+    // SAFETY: a valid out pointer.
+    unsafe { windows::Win32::Media::MediaFoundation::MFCreateAttributes(&mut attributes, 1)? };
+    attributes.ok_or_else(|| E_POINTER.into())
+}
 
 // ---------------------------------------------------------------- diagnostics
 
@@ -83,12 +97,15 @@ unsafe extern "system" fn DllGetClassObject(clsid: *const GUID, iid: *const GUID
     if clsid.is_null() || iid.is_null() || object.is_null() {
         return E_POINTER;
     }
-    *object = std::ptr::null_mut();
-    if *clsid != CLSID {
-        return CLASS_E_CLASSNOTAVAILABLE;
+    // SAFETY: the pointers are non-null (checked above) and valid, as COM promises.
+    unsafe {
+        *object = std::ptr::null_mut();
+        if *clsid != CLSID {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        }
+        let factory: IClassFactory = Factory.into();
+        factory.query(iid, object)
     }
-    let factory: IClassFactory = Factory.into();
-    factory.query(iid, object)
 }
 
 /// Never unload: the camera service may keep threads of ours around briefly.

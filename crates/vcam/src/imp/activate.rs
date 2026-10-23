@@ -10,7 +10,7 @@ use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows_core::Ref;
 
 use super::source::Source;
-use super::vlog;
+use super::{lock, new_attributes, vlog};
 
 #[implement(IMFActivate)]
 pub struct Activate {
@@ -20,41 +20,39 @@ pub struct Activate {
 
 impl Activate {
     pub fn new() -> windows::core::Result<Self> {
-        Ok(Self { attributes: unsafe { create_attributes()? }, source: Mutex::new(None) })
+        Ok(Self { attributes: new_attributes()?, source: Mutex::new(None) })
     }
-}
-
-unsafe fn create_attributes() -> windows::core::Result<IMFAttributes> {
-    let mut attributes = None;
-    MFCreateAttributes(&mut attributes, 1)?;
-    attributes.ok_or_else(|| E_POINTER.into())
 }
 
 impl IMFActivate_Impl for Activate_Impl {
     fn ActivateObject(&self, iid: *const GUID, object: *mut *mut c_void) -> windows::core::Result<()> {
         vlog!("activate ActivateObject");
-        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        let mut source = lock(&self.source);
         // The client may have shut the previous source down.
         if source.as_ref().is_none_or(|s| s.is_shut_down()) {
             *source = Some(Source::create()?);
         }
         let source: IMFMediaSourceEx = source.as_ref().map(|s| s.to_interface()).ok_or(E_POINTER)?;
+        // SAFETY: COM passes a valid interface id and out pointer.
         unsafe { source.query(iid, object).ok() }
     }
 
     fn ShutdownObject(&self) -> windows::core::Result<()> {
         vlog!("activate ShutdownObject");
-        if let Some(source) = self.source.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(source) = lock(&self.source).take() {
             source.shutdown();
         }
         Ok(())
     }
 
     fn DetachObject(&self) -> windows::core::Result<()> {
-        *self.source.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *lock(&self.source) = None;
         Ok(())
     }
 }
+
+// SAFETY (both macros): `attributes` is a live attribute store, and the arguments come
+// unchanged from our COM caller, who guarantees them valid for this very method.
 
 /// Forward an `IMFAttributes` method to the inner attribute store through its vtable.
 macro_rules! forward {
