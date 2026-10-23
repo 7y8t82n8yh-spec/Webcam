@@ -1,2 +1,11 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Build the C runtime into the programs and the camera DLL, so they don't need the
+# Visual C++ Redistributable (vcruntime140.dll) installed. Crates that compile C/C++
+# (OpenH264, ring) follow this setting too.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

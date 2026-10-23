@@ -54,6 +54,17 @@ jobs:
       - name: Build (release, all targets)
         run: cargo build --release --workspace --all-targets
 
+      # The runner has the Visual C++ runtime installed, users may not: make sure
+      # nothing depends on it (see .cargo/config.toml).
+      - name: No Visual C++ runtime dependency
+        shell: pwsh
+        run: |
+          foreach ($file in "iphone-webcam.exe", "iPhoneWebcamVCam.dll", "vcam-probe.exe") {
+            $bytes = [IO.File]::ReadAllBytes("target\release\$file")
+            $text = [Text.Encoding]::ASCII.GetString($bytes)
+            if ($text -match "(?i)vcruntime\d+\.dll|msvcp\d+\.dll") { throw "$file imports $($Matches[0])" }
+          }
+
       - name: Tests (headless Chrome with a fake camera)
         shell: pwsh
         run: |
