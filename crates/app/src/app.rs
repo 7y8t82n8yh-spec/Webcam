@@ -64,9 +64,9 @@ impl App {
         let certs = certs::ensure(&settings.data_dir, &ips)?;
         let key = load_or_create_key(&settings.data_dir)?;
 
-        let hub = Arc::new(FrameHub::new(settings.width, settings.height, settings.mode));
         // This image is what video-call participants see, so it must not show the key.
-        hub.set_placeholder_text(&["Waiting for iPhone...", "Scan the QR code in the iPhone Webcam window"]);
+        let waiting = ["Waiting for iPhone...", "Scan the QR code in the iPhone Webcam window"];
+        let hub = Arc::new(FrameHub::new(settings.width, settings.height, settings.mode, &waiting));
         let config = StreamConfig {
             width: settings.width,
             height: settings.height,

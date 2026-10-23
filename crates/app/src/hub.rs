@@ -51,8 +51,8 @@ pub struct Stats {
 }
 
 struct State {
-    frame: Option<Arc<Frame>>,
-    last_frame: Option<Instant>,
+    /// The phone's latest frame and when it arrived.
+    latest: Option<(Arc<Frame>, Instant)>,
     placeholder: Arc<Frame>,
     stats: Stats,
 }
@@ -66,25 +66,15 @@ pub struct FrameHub {
 }
 
 impl FrameHub {
-    pub fn new(width: u32, height: u32, mode: FitMode) -> Self {
-        let placeholder = Arc::new(placeholder(width, height, &["Waiting for iPhone..."]));
-        Self {
-            width,
-            height,
-            mode,
-            state: Mutex::new(State { frame: None, last_frame: None, placeholder, stats: Stats::default() }),
-        }
-    }
-
-    pub fn set_placeholder_text(&self, lines: &[&str]) {
-        let frame = Arc::new(placeholder(self.width, self.height, lines));
-        self.state.lock().unwrap().placeholder = frame;
+    /// `placeholder_text` is shown while no phone is streaming.
+    pub fn new(width: u32, height: u32, mode: FitMode, placeholder_text: &[&str]) -> Self {
+        let placeholder = Arc::new(placeholder(width, height, placeholder_text));
+        Self { width, height, mode, state: Mutex::new(State { latest: None, placeholder, stats: Stats::default() }) }
     }
 
     fn store(&self, frame: Frame, source: (u32, u32), transport: &'static str) {
         let mut s = self.state.lock().unwrap();
-        s.frame = Some(Arc::new(frame));
-        s.last_frame = Some(Instant::now());
+        s.latest = Some((Arc::new(frame), Instant::now()));
         s.stats.frames_in += 1;
         s.stats.source_size = source;
         s.stats.transport = transport;
@@ -122,14 +112,14 @@ impl FrameHub {
     /// The frame to show now: the phone's, or the placeholder if it went quiet.
     pub fn latest(&self) -> Arc<Frame> {
         let s = self.state.lock().unwrap();
-        match (&s.frame, s.last_frame) {
-            (Some(frame), Some(at)) if at.elapsed() < STALE_AFTER => frame.clone(),
+        match &s.latest {
+            Some((frame, at)) if at.elapsed() < STALE_AFTER => frame.clone(),
             _ => s.placeholder.clone(),
         }
     }
 
     pub fn streaming(&self) -> bool {
-        self.state.lock().unwrap().last_frame.is_some_and(|at| at.elapsed() < STALE_AFTER)
+        self.state.lock().unwrap().latest.as_ref().is_some_and(|(_, at)| at.elapsed() < STALE_AFTER)
     }
 
     pub fn stats(&self) -> Stats {
@@ -280,7 +270,7 @@ mod tests {
 
     #[test]
     fn small_frames_are_upscaled_and_garbage_rejected() {
-        let hub = FrameHub::new(1280, 720, FitMode::Fit);
+        let hub = FrameHub::new(1280, 720, FitMode::Fit, &["Waiting for iPhone..."]);
         let placeholder = hub.latest();
         assert!(!hub.push_jpeg(b"not a jpeg"));
         assert_eq!(hub.stats().decode_errors, 1);

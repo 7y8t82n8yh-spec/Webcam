@@ -99,10 +99,13 @@ pub fn rgb_to_yuyv(rgb: &[u8], yuyv: &mut [u8]) {
 
 // ---------------------------------------------------------------- the one ioctl
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("the v4l2 format layout below is the 64-bit one");
+
 const PIX_FMT_YUYV: u32 = u32::from_le_bytes(*b"YUYV");
 
-/// `struct v4l2_format` holding a `v4l2_pix_format`. The kernel's union is 200 bytes
-/// and pointer aligned, hence the padding after `kind`.
+/// `struct v4l2_format` holding a `v4l2_pix_format`, as on 64-bit Linux: the kernel's
+/// union is 200 bytes and pointer aligned, hence the padding after `kind`.
 #[repr(C)]
 struct Format {
     kind: u32,

@@ -36,7 +36,8 @@ fn web() {
     let dist = root.join("crates/app/web-dist");
     let pkg = dist.join("pkg");
     std::fs::create_dir_all(&pkg).unwrap();
-    let wasm = root.join("target/wasm32-unknown-unknown/release/web.wasm");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), Into::into);
+    let wasm = target_dir.join("wasm32-unknown-unknown/release/web.wasm");
     let mut bindgen = Command::new("wasm-bindgen");
     bindgen.arg(wasm).args(["--target", "web", "--no-typescript", "--out-name", "web", "--out-dir"]).arg(&pkg);
     run(&mut bindgen);

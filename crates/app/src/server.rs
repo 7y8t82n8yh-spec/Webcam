@@ -45,16 +45,17 @@ struct Active {
 }
 
 enum Conn {
-    Ws { id: u64, commands: mpsc::UnboundedSender<WsCommand> },
+    Ws { id: u64, end: mpsc::UnboundedSender<EndWs> },
     Rtc(RtcSession),
     Http,
 }
 
 type WsSender = SplitSink<WebSocket, Message>;
 
-enum WsCommand {
-    Replaced,
-    Close,
+/// Tells a WebSocket connection to close, after telling the phone why if another
+/// device took over.
+struct EndWs {
+    tell_replaced: bool,
 }
 
 impl Conn {
@@ -68,11 +69,8 @@ impl Conn {
 
     fn end(&self, tell_replaced: bool) {
         match self {
-            Conn::Ws { commands, .. } => {
-                if tell_replaced {
-                    let _ = commands.send(WsCommand::Replaced);
-                }
-                let _ = commands.send(WsCommand::Close);
+            Conn::Ws { end, .. } => {
+                let _ = end.send(EndWs { tell_replaced });
             }
             Conn::Rtc(session) => {
                 if tell_replaced {
@@ -277,8 +275,8 @@ async fn websocket(State(server): State<Arc<Server>>, Query(query): Query<WsQuer
 
 async fn handle_socket(server: Arc<Server>, client: String, socket: WebSocket) {
     let id = next_connection_id();
-    let (commands, mut command_rx) = mpsc::unbounded_channel();
-    server.take_over(&client, Conn::Ws { id, commands });
+    let (end, mut end_rx) = mpsc::unbounded_channel();
+    server.take_over(&client, Conn::Ws { id, end });
 
     let (mut tx, mut rx) = socket.split();
     let config = serde_json::to_string(&ServerMessage::Config(server.config.clone())).unwrap();
@@ -287,12 +285,20 @@ async fn handle_socket(server: Arc<Server>, client: String, socket: WebSocket) {
         return;
     }
     loop {
-        let keep_going = tokio::select! {
-            message = rx.next() => on_ws_message(&server, &mut tx, message).await,
-            command = command_rx.recv() => on_ws_command(&mut tx, command).await,
-        };
-        if !keep_going {
-            break;
+        tokio::select! {
+            message = rx.next() => {
+                if !on_ws_message(&server, &mut tx, message).await {
+                    break;
+                }
+            }
+            end = end_rx.recv() => {
+                if end.is_some_and(|end| end.tell_replaced) {
+                    let replaced = serde_json::to_string(&ServerMessage::Replaced).unwrap();
+                    let _ = tx.send(Message::Text(replaced.into())).await;
+                }
+                let _ = tx.send(Message::Close(None)).await;
+                break;
+            }
         }
     }
     server.ended(id);
@@ -315,21 +321,6 @@ async fn on_ws_message(server: &Server, tx: &mut WsSender, message: Option<Resul
         }
         Some(Ok(_)) => true,
         Some(Err(_)) | None => false,
-    }
-}
-
-/// Carry out a command for the connection; false ends it.
-async fn on_ws_command(tx: &mut WsSender, command: Option<WsCommand>) -> bool {
-    match command {
-        Some(WsCommand::Replaced) => {
-            let msg = serde_json::to_string(&ServerMessage::Replaced).unwrap();
-            let _ = tx.send(Message::Text(msg.into())).await;
-            true
-        }
-        Some(WsCommand::Close) | None => {
-            let _ = tx.send(Message::Close(None)).await;
-            false
-        }
     }
 }
 
