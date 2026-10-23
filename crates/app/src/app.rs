@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use protocol::StreamConfig;
 
-use crate::camera::{self, CameraSink};
+use crate::camera::{self, CameraConfig};
 use crate::hub::{FitMode, FrameHub};
 use crate::server::{self, Server};
 use crate::{certs, netutil};
@@ -57,25 +57,6 @@ pub fn load_or_create_key(dir: &Path) -> Result<String> {
     Ok(key)
 }
 
-/// Open the virtual camera unless it's disabled, recording the outcome in `status`.
-fn open_camera(settings: &Settings, status: &Mutex<String>) -> Option<Box<dyn CameraSink>> {
-    if !settings.camera {
-        *status.lock().unwrap() = "disabled (--no-camera)".into();
-        return None;
-    }
-    match camera::open(&settings.camera_name, settings.width, settings.height) {
-        Ok(sink) => {
-            *status.lock().unwrap() = sink.describe();
-            Some(sink)
-        }
-        Err(err) => {
-            tracing::error!("virtual camera unavailable: {err:#}");
-            *status.lock().unwrap() = format!("unavailable: {err:#}");
-            None
-        }
-    }
-}
-
 impl App {
     pub fn start(settings: Settings) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -112,8 +93,12 @@ impl App {
         let urls = url_ips.iter().map(|ip| format!("https://{ip}:{}/?k={key}", bound.port())).collect();
 
         let camera_status = Arc::new(Mutex::new(String::from("not started")));
-        let sink = open_camera(&settings, &camera_status);
-        let camera_thread = camera::OutputThread::spawn(hub.clone(), sink, settings.fps, camera_status.clone());
+        let camera = settings.camera.then(|| CameraConfig {
+            name: settings.camera_name.clone(),
+            width: settings.width,
+            height: settings.height,
+        });
+        let camera_thread = camera::OutputThread::spawn(hub.clone(), camera, settings.fps, camera_status.clone());
 
         Ok(Self {
             hub,
