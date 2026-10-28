@@ -10,6 +10,7 @@ pub mod decode;
 pub mod gui;
 pub mod hub;
 pub mod netutil;
+pub mod plain_http;
 pub mod server;
 pub mod web_assets;
 pub mod webrtc;

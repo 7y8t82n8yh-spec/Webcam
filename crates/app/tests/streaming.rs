@@ -50,6 +50,21 @@ async fn endpoints_require_the_pairing_key() {
     }
 }
 
+/// Safari opens an address typed without a scheme over plain HTTP.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_http_is_redirected_to_https() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let test_app = TestApp::start();
+    let address = test_app.client.base_url.trim_start_matches("https://").to_string();
+    let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+    stream.write_all(b"GET /?k=abc HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 301"), "{response}");
+    assert!(response.contains(&format!("Location: https://{address}/?k=abc\r\n")), "{response}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn jpeg_frames_over_https_post() {
     const FRAMES: u64 = 5;

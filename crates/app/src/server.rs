@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientInfo, ClientMessage, OfferRequest, OfferResponse, ServerMessage, StreamConfig};
@@ -19,6 +20,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::hub::FrameHub;
+use crate::plain_http::RedirectPlainHttp;
 use crate::web_assets;
 use crate::webrtc::{self, RtcSession};
 
@@ -335,9 +337,10 @@ pub fn run(
 ) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let serving = async {
-        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+        let tls = RustlsConfig::from_pem(cert_pem, key_pem).await?;
         let service = server.router().into_make_service();
-        axum_server::from_tcp_rustls(listener, tls)?.handle(handle).serve(service).await?;
+        let acceptor = RustlsAcceptor::new(tls).acceptor(RedirectPlainHttp);
+        axum_server::from_tcp(listener)?.acceptor(acceptor).handle(handle).serve(service).await?;
         anyhow::Ok(())
     };
     if let Err(err) = runtime.block_on(serving) {
