@@ -11,7 +11,7 @@ axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
 epaint_default_fonts = "0.37.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 if-addrs = "0.15.0"

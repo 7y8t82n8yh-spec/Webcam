@@ -1,5 +1,6 @@
 //! The latest frame from the phone, scaled to the virtual camera's size.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,40 @@ pub enum FitMode {
     Fit,
     /// Crop the picture so it fills the frame.
     Fill,
+}
+
+/// How far to turn the phone's picture clockwise, in quarter turns (0 to 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rotation(u8);
+
+impl Rotation {
+    pub fn degrees(self) -> u32 {
+        self.0 as u32 * 90
+    }
+
+    /// A quarter turn further clockwise (`quarters` = 1) or anticlockwise (-1).
+    pub fn turned(self, quarters: i8) -> Self {
+        Rotation((self.0 as i8 + quarters).rem_euclid(4) as u8)
+    }
+
+    /// Size of a `width x height` picture after turning it.
+    fn size(self, width: u32, height: u32) -> (u32, u32) {
+        if self.0 % 2 == 1 {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
+    /// Where pixel (x, y) of the turned picture comes from in the `width x height` original.
+    fn source(self, x: u32, y: u32, width: u32, height: u32) -> (u32, u32) {
+        match self.0 {
+            1 => (y, height - 1 - x),
+            2 => (width - 1 - x, height - 1 - y),
+            3 => (width - 1 - y, x),
+            _ => (x, y),
+        }
+    }
 }
 
 /// A tightly packed RGB24 image.
@@ -62,6 +97,8 @@ pub struct FrameHub {
     pub width: u32,
     pub height: u32,
     mode: FitMode,
+    /// Quarter turns, changed from the window while streaming.
+    rotation: AtomicU8,
     state: Mutex<State>,
 }
 
@@ -69,7 +106,21 @@ impl FrameHub {
     /// `placeholder_text` is shown while no phone is streaming.
     pub fn new(width: u32, height: u32, mode: FitMode, placeholder_text: &[&str]) -> Self {
         let placeholder = Arc::new(placeholder(width, height, placeholder_text));
-        Self { width, height, mode, state: Mutex::new(State { latest: None, placeholder, stats: Stats::default() }) }
+        let state = Mutex::new(State { latest: None, placeholder, stats: Stats::default() });
+        Self { width, height, mode, rotation: AtomicU8::new(0), state }
+    }
+
+    pub fn rotation(&self) -> Rotation {
+        Rotation(self.rotation.load(Ordering::Relaxed))
+    }
+
+    /// Turn the phone's picture from the next frame on.
+    pub fn set_rotation(&self, rotation: Rotation) {
+        self.rotation.store(rotation.0, Ordering::Relaxed);
+    }
+
+    fn output(&self) -> Output {
+        Output { width: self.width, height: self.height, mode: self.mode, rotation: self.rotation() }
     }
 
     fn store(&self, frame: Frame, source: (u32, u32), transport: &'static str) {
@@ -82,7 +133,7 @@ impl FrameHub {
 
     /// Decode a JPEG from the fallback transports. Returns false if it isn't one.
     pub fn push_jpeg(&self, data: &[u8]) -> bool {
-        match decode_jpeg(data, self.width, self.height, self.mode) {
+        match decode_jpeg(data, self.output()) {
             Ok((frame, source)) => {
                 self.store(frame, source, "JPEG");
                 true
@@ -97,7 +148,7 @@ impl FrameHub {
 
     /// Store a decoded WebRTC picture.
     pub fn push_yuv(&self, picture: &Yuv420) {
-        let frame = convert_yuv(picture, self.width, self.height, self.mode);
+        let frame = convert_yuv(picture, self.output());
         self.store(frame, (picture.width, picture.height), "WebRTC");
     }
 
@@ -137,9 +188,21 @@ fn scaled_size(sw: u32, sh: u32, w: u32, h: u32, mode: FitMode) -> (u32, u32) {
     (((sw as f64 * scale).round() as u32).max(1), ((sh as f64 * scale).round() as u32).max(1))
 }
 
-/// Fill a `w x h` RGB frame by sampling a `sw x sh` source, scaled and centred per
-/// `mode` (nearest neighbour). `sample(x, y)` returns the source pixel.
-fn resample(sw: u32, sh: u32, w: u32, h: u32, mode: FitMode, sample: impl Fn(u32, u32) -> [u8; 3]) -> Frame {
+/// The frame the phone's pictures are turned into.
+#[derive(Clone, Copy)]
+struct Output {
+    width: u32,
+    height: u32,
+    mode: FitMode,
+    rotation: Rotation,
+}
+
+/// Make the output frame from a `source_width x source_height` picture: turned, then
+/// scaled and centred per the mode (nearest neighbour). `sample(x, y)` returns a
+/// pixel of the picture.
+fn resample((source_width, source_height): (u32, u32), output: Output, sample: impl Fn(u32, u32) -> [u8; 3]) -> Frame {
+    let Output { width: w, height: h, mode, rotation } = output;
+    let (sw, sh) = rotation.size(source_width, source_height);
     let (tw, th) = scaled_size(sw, sh, w, h, mode);
     // Offset of the scaled picture inside the output; negative when cropping.
     let ox = (w as i64 - tw as i64) / 2;
@@ -154,14 +217,15 @@ fn resample(sw: u32, sh: u32, w: u32, h: u32, mode: FitMode, sample: impl Fn(u32
         let Some(sy) = map(y as u32, oy, th, sh) else { continue };
         for (px, sx) in row.chunks_exact_mut(3).zip(&xmap) {
             if let Some(sx) = sx {
-                px.copy_from_slice(&sample(*sx, sy));
+                let (x, y) = rotation.source(*sx, sy, source_width, source_height);
+                px.copy_from_slice(&sample(x, y));
             }
         }
     }
     frame
 }
 
-fn decode_jpeg(data: &[u8], w: u32, h: u32, mode: FitMode) -> anyhow::Result<(Frame, (u32, u32))> {
+fn decode_jpeg(data: &[u8], output: Output) -> anyhow::Result<(Frame, (u32, u32))> {
     use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(data), options);
@@ -173,7 +237,7 @@ fn decode_jpeg(data: &[u8], w: u32, h: u32, mode: FitMode) -> anyhow::Result<(Fr
         let i = ((y * sw + x) * 3) as usize;
         [pixels[i], pixels[i + 1], pixels[i + 2]]
     };
-    let frame = resample(sw, sh, w, h, mode, sample);
+    let frame = resample((sw, sh), output, sample);
     Ok((frame, (sw, sh)))
 }
 
@@ -186,13 +250,13 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     [clamp(c + 409 * e), clamp(c - 100 * d - 208 * e), clamp(c + 516 * d)]
 }
 
-fn convert_yuv(p: &Yuv420, w: u32, h: u32, mode: FitMode) -> Frame {
+fn convert_yuv(p: &Yuv420, output: Output) -> Frame {
     let sample = |x: u32, y: u32| {
         let luma = p.y[y as usize * p.y_stride + x as usize];
         let chroma = (y / 2) as usize * p.uv_stride + (x / 2) as usize;
         yuv_to_rgb(luma, p.u[chroma], p.v[chroma])
     };
-    resample(p.width, p.height, w, h, mode, sample)
+    resample((p.width, p.height), output, sample)
 }
 
 /// A dark frame with centred status text, shown while no phone is streaming.
@@ -256,14 +320,18 @@ mod tests {
         [f.rgb[i], f.rgb[i + 1], f.rgb[i + 2]]
     }
 
+    fn output(width: u32, height: u32, mode: FitMode) -> Output {
+        Output { width, height, mode, rotation: Rotation::default() }
+    }
+
     #[test]
     fn portrait_is_letterboxed_or_cropped() {
         let jpeg = solid_jpeg(720, 1280, [200, 30, 30]);
-        let (fit, src) = decode_jpeg(&jpeg, 1280, 720, FitMode::Fit).unwrap();
+        let (fit, src) = decode_jpeg(&jpeg, output(1280, 720, FitMode::Fit)).unwrap();
         assert_eq!(src, (720, 1280));
         assert_eq!(px(&fit, 0, 360), [0, 0, 0]);
         assert!(px(&fit, 640, 360)[0] > 180);
-        let (fill, _) = decode_jpeg(&jpeg, 1280, 720, FitMode::Fill).unwrap();
+        let (fill, _) = decode_jpeg(&jpeg, output(1280, 720, FitMode::Fill)).unwrap();
         assert!(px(&fill, 0, 360)[0] > 180);
         assert_eq!(fill.rgb.len(), 1280 * 720 * 3);
     }
@@ -290,11 +358,29 @@ mod tests {
         let u = vec![78u8; 2];
         let v = vec![177u8; 2];
         let p = Yuv420 { width: w, height: h, y: &y, u: &u, v: &v, y_stride: 4, uv_stride: 2 };
-        let f = convert_yuv(&p, 4, 2, FitMode::Fit);
+        let f = convert_yuv(&p, output(4, 2, FitMode::Fit));
         let got = px(&f, 1, 1);
         for (g, want) in got.iter().zip([220u8, 120, 40]) {
             assert!((*g as i32 - want as i32).abs() <= 3, "{got:?}");
         }
+    }
+
+    #[test]
+    fn rotation_turns_the_picture() {
+        // A 2x1 picture: red on the left, blue on the right.
+        let colors = [[255, 0, 0], [0, 0, 255]];
+        let sample = |x: u32, _y: u32| colors[x as usize];
+        let turned = |quarters| {
+            let output = Output { width: 2, height: 2, mode: FitMode::Fill, rotation: Rotation(quarters) };
+            resample((2, 1), output, sample)
+        };
+        // A quarter turn clockwise puts red at the top.
+        assert_eq!(px(&turned(1), 0, 0), colors[0]);
+        assert_eq!(px(&turned(1), 0, 1), colors[1]);
+        assert_eq!(px(&turned(2), 0, 0), colors[1]);
+        assert_eq!(px(&turned(3), 0, 0), colors[1]);
+        assert_eq!(Rotation(0).turned(-1), Rotation(3));
+        assert_eq!(Rotation(3).turned(1).degrees(), 0);
     }
 
     #[test]

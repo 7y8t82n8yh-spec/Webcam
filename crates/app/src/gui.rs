@@ -129,6 +129,7 @@ impl Window {
             "○ Waiting for iPhone…".to_string()
         };
         ui.label(status);
+        self.rotate_buttons(ui);
         let camera = format!(
             "Virtual camera: {}, {}×{} @ {} fps",
             self.app.camera_status.lock().unwrap(),
@@ -137,6 +138,20 @@ impl Window {
             self.app.settings.fps
         );
         ui.label(RichText::new(camera).weak());
+    }
+
+    /// Turn the picture, for a phone held sideways or upside down.
+    fn rotate_buttons(&self, ui: &mut egui::Ui) {
+        let hub = &self.app.hub;
+        ui.horizontal(|ui| {
+            if ui.button("Rotate left").clicked() {
+                hub.set_rotation(hub.rotation().turned(-1));
+            }
+            if ui.button("Rotate right").clicked() {
+                hub.set_rotation(hub.rotation().turned(1));
+            }
+            ui.label(format!("{}°", hub.rotation().degrees()));
+        });
     }
 }
 
