@@ -82,6 +82,42 @@ pub const ACK: &str = "ack";
 /// Ditto, for a frame that could not be decoded.
 pub const BAD: &str = "bad";
 
+/// Header the admin page sends with every change it asks for. Browsers don't let
+/// other websites add it to requests without asking the server first (which the admin
+/// server never allows), so it shows the request came from the admin page itself.
+pub const ADMIN_HEADER: &str = "X-Admin";
+
+/// `GET /api/state` on the admin server (localhost only): what the PC is doing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminState {
+    /// Phone page addresses, one per LAN address of the PC.
+    pub urls: Vec<String>,
+    pub streaming: bool,
+    /// "WebRTC" or "JPEG".
+    pub transport: String,
+    /// Size of the phone's picture.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Frames received from the phone so far.
+    pub frames_in: u64,
+    /// What the virtual camera is doing.
+    pub camera: String,
+    /// Size of the virtual camera's picture (turned with the rotation).
+    pub output_width: u32,
+    pub output_height: u32,
+    pub fps: u32,
+    /// Clockwise: 0, 90, 180 or 270.
+    pub rotation: u32,
+}
+
+/// `POST /api/rotate`: turn the picture by `quarters` quarter turns (negative:
+/// anticlockwise).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RotateRequest {
+    pub quarters: i8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

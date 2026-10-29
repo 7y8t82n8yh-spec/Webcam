@@ -32,7 +32,7 @@ impl Rotation {
     }
 
     /// Size of a `width x height` picture after turning it.
-    fn size(self, width: u32, height: u32) -> (u32, u32) {
+    pub fn size(self, width: u32, height: u32) -> (u32, u32) {
         if self.0 % 2 == 1 {
             (height, width)
         } else {
@@ -88,16 +88,18 @@ pub struct Stats {
 struct State {
     /// The phone's latest frame and when it arrived.
     latest: Option<(Arc<Frame>, Instant)>,
-    placeholder: Arc<Frame>,
     stats: Stats,
 }
 
 /// Thread-safe holder of the latest frame.
 pub struct FrameHub {
-    pub width: u32,
-    pub height: u32,
+    /// The camera's size with the picture upright (rotation 0).
+    width: u32,
+    height: u32,
     mode: FitMode,
-    /// Quarter turns, changed from the window while streaming.
+    /// Shown while no phone streams: upright, and for a quarter turn.
+    placeholders: [Arc<Frame>; 2],
+    /// Quarter turns, changed from the admin page while streaming.
     rotation: AtomicU8,
     state: Mutex<State>,
 }
@@ -105,9 +107,16 @@ pub struct FrameHub {
 impl FrameHub {
     /// `placeholder_text` is shown while no phone is streaming.
     pub fn new(width: u32, height: u32, mode: FitMode, placeholder_text: &[&str]) -> Self {
-        let placeholder = Arc::new(placeholder(width, height, placeholder_text));
-        let state = Mutex::new(State { latest: None, placeholder, stats: Stats::default() });
-        Self { width, height, mode, rotation: AtomicU8::new(0), state }
+        let placeholders =
+            [placeholder(width, height, placeholder_text), placeholder(height, width, placeholder_text)].map(Arc::new);
+        let state = Mutex::new(State { latest: None, stats: Stats::default() });
+        Self { width, height, mode, placeholders, rotation: AtomicU8::new(0), state }
+    }
+
+    /// The camera's size now: turned with the picture, so a quarter turn gives a
+    /// portrait camera.
+    pub fn output_size(&self) -> (u32, u32) {
+        self.rotation().size(self.width, self.height)
     }
 
     pub fn rotation(&self) -> Rotation {
@@ -120,7 +129,8 @@ impl FrameHub {
     }
 
     fn output(&self) -> Output {
-        Output { width: self.width, height: self.height, mode: self.mode, rotation: self.rotation() }
+        let (width, height) = self.output_size();
+        Output { width, height, mode: self.mode, rotation: self.rotation() }
     }
 
     fn store(&self, frame: Frame, source: (u32, u32), transport: &'static str) {
@@ -160,12 +170,13 @@ impl FrameHub {
         self.state.lock().unwrap().stats.frames_out += 1;
     }
 
-    /// The frame to show now: the phone's, or the placeholder if it went quiet.
+    /// The frame to show now: the phone's, or the placeholder if it went quiet. Its
+    /// size is normally `output_size()`, but a frame from before a rotation can differ.
     pub fn latest(&self) -> Arc<Frame> {
         let s = self.state.lock().unwrap();
         match &s.latest {
             Some((frame, at)) if at.elapsed() < STALE_AFTER => frame.clone(),
-            _ => s.placeholder.clone(),
+            _ => self.placeholders[self.rotation().0 as usize % 2].clone(),
         }
     }
 
@@ -223,6 +234,17 @@ fn resample((source_width, source_height): (u32, u32), output: Output, sample: i
         }
     }
     frame
+}
+
+/// `frame` scaled to fit `width x height`, with black bars: for a camera that can't
+/// change its size to the frame's.
+pub fn letterbox(frame: &Frame, width: u32, height: u32) -> Frame {
+    let output = Output { width, height, mode: FitMode::Fit, rotation: Rotation::default() };
+    let sample = |x: u32, y: u32| {
+        let i = ((y * frame.width + x) * 3) as usize;
+        [frame.rgb[i], frame.rgb[i + 1], frame.rgb[i + 2]]
+    };
+    resample((frame.width, frame.height), output, sample)
 }
 
 fn decode_jpeg(data: &[u8], output: Output) -> anyhow::Result<(Frame, (u32, u32))> {
@@ -380,7 +402,30 @@ mod tests {
         assert_eq!(px(&turned(2), 0, 0), colors[1]);
         assert_eq!(px(&turned(3), 0, 0), colors[1]);
         assert_eq!(Rotation(0).turned(-1), Rotation(3));
+        assert_eq!(Rotation(1).size(1280, 720), (720, 1280));
         assert_eq!(Rotation(3).turned(1).degrees(), 0);
+    }
+
+    #[test]
+    fn a_quarter_turn_makes_the_camera_portrait() {
+        let hub = FrameHub::new(1280, 720, FitMode::Fit, &["Waiting"]);
+        hub.set_rotation(Rotation(1));
+        assert_eq!(hub.output_size(), (720, 1280));
+        let placeholder = hub.latest();
+        assert_eq!((placeholder.width, placeholder.height), (720, 1280));
+        assert!(hub.push_jpeg(&solid_jpeg(1280, 720, [10, 200, 10])));
+        let frame = hub.latest();
+        assert_eq!((frame.width, frame.height), (720, 1280));
+        // A landscape picture turned upright fills the portrait camera.
+        assert!(px(&frame, 0, 0)[1] > 180 && px(&frame, 719, 1279)[1] > 180);
+    }
+
+    #[test]
+    fn letterbox_keeps_the_aspect() {
+        let frame = Frame { width: 2, height: 4, rgb: [255u8, 255, 255].repeat(8) };
+        let boxed = letterbox(&frame, 8, 4);
+        assert_eq!(px(&boxed, 0, 0), [0, 0, 0]);
+        assert_eq!(px(&boxed, 4, 2), [255, 255, 255]);
     }
 
     #[test]

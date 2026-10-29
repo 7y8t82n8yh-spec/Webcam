@@ -62,8 +62,10 @@ compiled to WebAssembly.
 
 ## Daily use
 
-1. Start `iphone-webcam` (`iphone-webcam.exe` on Windows). A window shows a QR code,
-   the address, and a live preview. On Windows the camera exists while the app runs.
+1. Start `iphone-webcam` (`iphone-webcam.exe` on Windows). It opens its admin page in
+   your browser, at `http://127.0.0.1:8444`, with a QR code, the address, and a live
+   preview. Only this PC can open that page. On Windows the camera exists while the
+   app runs; close its console window (or press Ctrl+C) to quit.
 2. With the iPhone on the **same Wi-Fi**, scan the QR code with the Camera app. It
    opens Safari. The link contains a pairing key, so only phones that scanned the code
    can send video to the PC. The key is kept between runs, so a bookmark on the phone
@@ -72,6 +74,12 @@ compiled to WebAssembly.
    its own certificate. Tap **Show Details → visit this website → Visit Website**.
 4. Tap **Start camera** and allow camera access.
 5. Pick **iPhone Webcam** as the camera in your video app.
+
+**Rotating:** the admin page's **Rotate left/right** buttons turn the picture, for a
+phone held sideways or upside down. After a quarter turn the camera becomes portrait
+(720×1280 instead of 1280×720). A video app keeps the size it chose until it opens the
+camera again, so turn its video off and on after rotating; until then it gets the
+turned picture with black bars.
 
 The phone page has buttons for switching the front and back cameras, choosing a
 resolution, mirroring the preview, and **Dim**, which blacks out the screen to save
@@ -91,7 +99,7 @@ Trust Settings. The certificate is generated on your PC and stored in
 iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
                   [--bitrate 6] [--quality 0.75] [--mode fit|fill]
                   [--camera-name NAME] [--host 0.0.0.0] [--data-dir DIR]
-                  [--no-camera] [--no-gui] [-v]
+                  [--admin-port 8444] [--no-camera] [--no-browser] [-v]
                   [install [--dll PATH] | uninstall]
 ```
 
@@ -99,6 +107,8 @@ iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
   only by the fallback transports.
 * `--mode fit` (default) letterboxes a portrait phone picture into the 16:9 camera.
   `--mode fill` crops it instead.
+* `--no-browser` doesn't open the admin page at startup. If port 8444 is taken, the
+  app picks another and prints the address.
 * If you change `--port`, run `iphone-webcam.exe --port <n> install` again so the
   firewall rule matches.
 
@@ -109,8 +119,9 @@ iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
 * **Keep Safari in the foreground.** iOS stops camera access for web pages when they're
   in the background or the phone is locked. Leave the page open and use *Dim*. The
   stream resumes automatically when you come back to the page.
-* The Windows camera offers 640×360, 1280×720 and 1920×1080 at 30 fps. On Linux the
-  camera has the app's `--width`/`--height` (1280×720 by default) in YUYV.
+* The Windows camera offers 640×360, 1280×720 and 1920×1080 at 30 fps, and the same
+  sizes in portrait. On Linux the camera has the app's `--width`/`--height` (1280×720
+  by default, turned when rotated) in YUYV.
 * WebRTC is capped at 6 Mbit/s (`--bitrate`). It starts around 2.5 Mbit/s and adjusts
   to the network from there. The JPEG fallback uses more bandwidth for the same
   quality. There's no audio, so use your PC's microphone.
@@ -124,7 +135,7 @@ iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
   - If you once clicked *Cancel* on a Windows Firewall prompt for `iphone-webcam.exe`,
     Windows created a *block* rule, and block rules win over allow rules. Remove it
     under *Windows Defender Firewall → Allow an app through firewall*.
-* **Linux: the window says no v4l2loopback device was found.** Run `iphone-webcam
+* **Linux: the admin page says no v4l2loopback device was found.** Run `iphone-webcam
   install`, and check `sudo dmesg` if the module doesn't load.
 * **"Pairing key rejected".** You opened an old link or typed the address by hand. Scan
   the QR code again. Deleting `%APPDATA%\iPhoneWebcam\pairing-key.txt` makes a new key,
@@ -136,7 +147,7 @@ iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
   background. Switch back to Safari; the stream resumes on its own.
 * **Video app shows the "Waiting for iPhone…" image.** The camera works and no phone
   is streaming. Tap *Start camera* on the phone.
-* **The window says the virtual camera is unavailable.** Run `iphone-webcam.exe install`.
+* **The admin page says the virtual camera is unavailable.** Run `iphone-webcam.exe install`.
   If it mentions access being denied, Windows' camera privacy settings block it: turn
   on Settings → Privacy & security → Camera → *Camera access* and *Let desktop apps
   access your camera*.
@@ -172,7 +183,7 @@ programs as artifacts.
 
 | Path | What it does |
 | --- | --- |
-| `crates/web` | The phone page in Rust/WebAssembly: camera, wake lock, WebRTC sender, JPEG fallbacks |
+| `crates/web` | The phone page in Rust/WebAssembly: camera, wake lock, WebRTC sender, JPEG fallbacks; and the admin page (`admin.rs`) |
 | `crates/app/src/server.rs` | HTTPS server: page, `/offer` WebRTC signalling, `/ws` and `/frame` fallbacks, `/ca.crt` |
 | `crates/app/src/webrtc.rs` | WebRTC receiver ([str0m](https://github.com/algesten/str0m)) and decoder thread |
 | `crates/app/src/decode.rs` | H.264 decoding (OpenH264) |
@@ -180,9 +191,10 @@ programs as artifacts.
 | `crates/app/src/vcam_client.rs` | Creates the Windows 11 camera and hands it frames through shared memory |
 | `crates/app/src/v4l2.rs` | Linux camera: writes frames to a v4l2loopback device |
 | `crates/app/src/certs.rs` | Local CA (restricted to private addresses) and server certificates |
-| `crates/app/src/gui.rs` | Status window with QR code and preview ([egui](https://github.com/emilk/egui)) |
+| `crates/app/src/admin.rs` | Admin page server on 127.0.0.1: state, QR code, preview, rotation |
+| `crates/app/src/plain_http.rs` | Redirects `http://` requests on the phone's port to `https://` |
 | `crates/app/src/install.rs`, `install_linux.rs` | `install` / `uninstall`: camera setup and firewall rules |
 | `crates/vcam` | The camera DLL: a Media Foundation media source run by Windows' camera service |
 | `crates/vcam-probe` | Test tool that reads a camera through Media Foundation |
 | `crates/protocol` | Messages and the shared-memory layout used by more than one crate |
-| `xtask` | `cargo xtask web` builds the phone page |
+| `xtask` | `cargo xtask web` builds the phone and admin pages |

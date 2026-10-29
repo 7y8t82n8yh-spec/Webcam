@@ -3,11 +3,11 @@
 //! The phone opens a page served by this app and streams its camera over WebRTC
 //! (H.264), or JPEG frames as a fallback; frames feed a virtual camera.
 
+pub mod admin;
 pub mod app;
 pub mod camera;
 pub mod certs;
 pub mod decode;
-pub mod gui;
 pub mod hub;
 pub mod netutil;
 pub mod plain_http;

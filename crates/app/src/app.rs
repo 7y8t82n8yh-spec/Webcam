@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use protocol::StreamConfig;
 
+use crate::admin::Admin;
 use crate::camera::{self, CameraConfig};
 use crate::hub::{FitMode, FrameHub};
 use crate::server::{self, Server};
@@ -17,6 +18,8 @@ use crate::{certs, netutil};
 pub struct Settings {
     pub host: IpAddr,
     pub port: u16,
+    /// Port of the admin page on 127.0.0.1; another is picked if it's taken.
+    pub admin_port: u16,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -32,6 +35,8 @@ pub struct App {
     pub hub: Arc<FrameHub>,
     pub server: Arc<Server>,
     pub urls: Vec<String>,
+    /// The admin page, for this PC's browser.
+    pub admin_url: String,
     pub settings: Settings,
     pub bound: SocketAddr,
     /// What the virtual camera is doing, for display.
@@ -65,7 +70,7 @@ impl App {
         let key = load_or_create_key(&settings.data_dir)?;
 
         // This image is what video-call participants see, so it must not show the key.
-        let waiting = ["Waiting for iPhone...", "Scan the QR code in the iPhone Webcam window"];
+        let waiting = ["Waiting for iPhone...", "Scan the QR code on the iPhone Webcam page"];
         let hub = Arc::new(FrameHub::new(settings.width, settings.height, settings.mode, &waiting));
         let config = StreamConfig {
             width: settings.width,
@@ -81,18 +86,29 @@ impl App {
         let listener = TcpListener::bind(addr).with_context(|| format!("could not listen on {addr}"))?;
         listener.set_nonblocking(true)?;
         let bound = listener.local_addr()?;
-        let server_handle = axum_server::Handle::new();
-        let serve = {
-            let (server, handle) = (server.clone(), server_handle.clone());
-            move || server::run(server, listener, certs.server_cert_pem, certs.server_key_pem, handle)
-        };
-        let server_thread = std::thread::Builder::new().name("server".into()).spawn(serve)?;
+        let admin_listener = bind_admin(settings.admin_port)?;
+        let admin_port = admin_listener.local_addr()?.port();
 
         // One URL per LAN address; localhost if there is none.
         let url_ips = if ips.is_empty() { vec![IpAddr::from([127, 0, 0, 1])] } else { ips.clone() };
-        let urls = url_ips.iter().map(|ip| format!("https://{ip}:{}/?k={key}", bound.port())).collect();
+        let urls: Vec<String> = url_ips.iter().map(|ip| format!("https://{ip}:{}/?k={key}", bound.port())).collect();
 
         let camera_status = Arc::new(Mutex::new(String::from("not started")));
+        let admin = Arc::new(Admin {
+            hub: hub.clone(),
+            urls: urls.clone(),
+            camera_status: camera_status.clone(),
+            fps: settings.fps,
+            port: admin_port,
+        });
+        let server_handle = axum_server::Handle::new();
+        let serve = {
+            let (server, handle) = (server.clone(), server_handle.clone());
+            let (cert, cert_key) = (certs.server_cert_pem, certs.server_key_pem);
+            move || server::run(server, listener, cert, cert_key, admin, admin_listener, handle)
+        };
+        let server_thread = std::thread::Builder::new().name("server".into()).spawn(serve)?;
+
         let camera = settings.camera.then(|| CameraConfig {
             name: settings.camera_name.clone(),
             width: settings.width,
@@ -104,6 +120,7 @@ impl App {
             hub,
             server,
             urls,
+            admin_url: format!("http://127.0.0.1:{admin_port}/"),
             settings,
             bound,
             camera_status,
@@ -127,6 +144,14 @@ impl App {
             let _ = thread.join();
         }
     }
+}
+
+/// The admin page's listener on 127.0.0.1: `port`, or any free one if that's taken
+/// (by a second copy of the app, say).
+fn bind_admin(port: u16) -> Result<TcpListener> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).or_else(|_| TcpListener::bind(("127.0.0.1", 0)))?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 impl Drop for App {

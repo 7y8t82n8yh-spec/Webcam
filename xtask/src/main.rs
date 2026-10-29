@@ -1,7 +1,7 @@
 //! Build tasks, run with `cargo xtask <task>`.
 //!
-//! * `web` - compile the phone page (crates/web) to WebAssembly and put it, with its
-//!   HTML, into crates/app/web-dist/ where the app embeds it. Needs the
+//! * `web` - compile the phone and admin pages (crates/web) to WebAssembly and put
+//!   them, with their HTML, into crates/app/web-dist/ where the app embeds them. Needs the
 //!   `wasm32-unknown-unknown` target and `wasm-bindgen-cli` at the same version as the
 //!   `wasm-bindgen` crate (see Cargo.lock).
 
@@ -41,9 +41,11 @@ fn web() {
     let mut bindgen = Command::new("wasm-bindgen");
     bindgen.arg(wasm).args(["--target", "web", "--no-typescript", "--out-name", "web", "--out-dir"]).arg(&pkg);
     run(&mut bindgen);
-    std::fs::copy(root.join("crates/web/static/index.html"), dist.join("index.html")).unwrap();
+    for page in ["index.html", "admin.html"] {
+        std::fs::copy(root.join("crates/web/static").join(page), dist.join(page)).unwrap();
+    }
     let size = std::fs::metadata(dist.join("pkg/web_bg.wasm")).map(|m| m.len()).unwrap_or(0);
-    eprintln!("phone page built into {} ({} KB of WebAssembly)", dist.display(), size / 1024);
+    eprintln!("pages built into {} ({} KB of WebAssembly)", dist.display(), size / 1024);
 }
 
 fn main() {

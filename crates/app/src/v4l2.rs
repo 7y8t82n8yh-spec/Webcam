@@ -6,11 +6,12 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::camera::CameraSink;
-use crate::hub::Frame;
+use crate::hub::{self, Frame};
 
 pub struct LoopbackDevice {
     pub path: PathBuf,
@@ -46,6 +47,7 @@ pub struct LoopbackCamera {
     width: u32,
     height: u32,
     yuyv: Vec<u8>,
+    last_resize_attempt: Option<Instant>,
 }
 
 impl LoopbackCamera {
@@ -68,13 +70,42 @@ impl LoopbackCamera {
             "{} refused {width}x{height} YUYV (in use by another program?)",
             device.path.display()
         );
-        Ok(Self { file, device, width, height, yuyv: vec![0; (width * height * 2) as usize] })
+        let yuyv = vec![0; (width * height * 2) as usize];
+        Ok(Self { file, device, width, height, yuyv, last_resize_attempt: None })
+    }
+
+    /// Switch the device to `width x height` (after a rotation). It only allows that
+    /// while no video app has it open, so this is retried once a second.
+    fn try_resize(&mut self, width: u32, height: u32) {
+        if self.last_resize_attempt.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.last_resize_attempt = Some(Instant::now());
+        let mut format = Format::yuyv(width, height);
+        // A device in use answers with the format it keeps.
+        let resized = set_format(&self.file, &mut format).is_ok()
+            && (format.width, format.height, format.pixelformat) == (width, height, PIX_FMT_YUYV);
+        if resized {
+            tracing::info!("{} is now {width}x{height}", self.device.path.display());
+            (self.width, self.height) = (width, height);
+            self.yuyv.resize((width * height * 2) as usize, 0);
+        }
     }
 }
 
 impl CameraSink for LoopbackCamera {
     fn send(&mut self, frame: &Frame) -> Result<()> {
-        ensure!(frame.width == self.width && frame.height == self.height, "frame size changed");
+        if (frame.width, frame.height) != (self.width, self.height) {
+            self.try_resize(frame.width, frame.height);
+        }
+        let letterboxed;
+        let frame = if (frame.width, frame.height) == (self.width, self.height) {
+            frame
+        } else {
+            // Still the old size: a video app has the camera open.
+            letterboxed = hub::letterbox(frame, self.width, self.height);
+            &letterboxed
+        };
         rgb_to_yuyv(&frame.rgb, &mut self.yuyv);
         self.file.write_all(&self.yuyv).with_context(|| format!("writing to {}", self.device.path.display()))
     }

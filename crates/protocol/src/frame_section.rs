@@ -14,8 +14,14 @@ use std::sync::atomic::{fence, Ordering};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 pub const SECTION_NAME: &str = r"Global\iPhoneWebcam_Frames";
-pub const MAX_WIDTH: u32 = 1920;
-pub const MAX_HEIGHT: u32 = 1080;
+/// The largest frame: 1080p, landscape or portrait.
+pub const MAX_SIDE: u32 = 1920;
+pub const MAX_PIXELS: u32 = 1920 * 1080;
+
+/// Whether a `width x height` frame fits in the section.
+pub fn fits(width: u32, height: u32) -> bool {
+    width > 0 && height > 0 && width <= MAX_SIDE && height <= MAX_SIDE && width * height <= MAX_PIXELS
+}
 
 /// COM class of the camera's media source (crates/vcam). The app passes it to
 /// `MFCreateVirtualCamera`; the installer registers it.
@@ -36,7 +42,7 @@ struct Header {
 const HEADER_SIZE: usize = 64;
 const _: () = assert!(std::mem::size_of::<Header>() <= HEADER_SIZE);
 
-pub const SECTION_SIZE: usize = HEADER_SIZE + (MAX_WIDTH as usize) * (MAX_HEIGHT as usize) * 3;
+pub const SECTION_SIZE: usize = HEADER_SIZE + MAX_PIXELS as usize * 3;
 
 /// What [`FrameReader::read_into`] found.
 pub enum Read {
@@ -63,7 +69,7 @@ impl Section {
     }
 
     fn write(&self, width: u32, height: u32, rgb: &[u8]) {
-        assert!(width <= MAX_WIDTH && height <= MAX_HEIGHT && rgb.len() == (width * height * 3) as usize);
+        assert!(fits(width, height) && rgb.len() == (width * height * 3) as usize);
         let header = self.header();
         let mut sequence = header.sequence.load(Ordering::Relaxed);
         if sequence % 2 == 1 {
@@ -92,7 +98,7 @@ impl Section {
             return Read::Busy;
         }
         let (width, height) = (header.width.load(Ordering::Relaxed), header.height.load(Ordering::Relaxed));
-        if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
+        if !fits(width, height) {
             return Read::Busy; // read mid-update
         }
         let len = (width * height * 3) as usize;

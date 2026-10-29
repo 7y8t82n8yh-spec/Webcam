@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, ensure, Context, Result};
-use protocol::frame_section::{FrameWriter, MAX_HEIGHT, MAX_WIDTH, VCAM_CLSID};
+use protocol::frame_section::{self, FrameWriter, VCAM_CLSID};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::E_ACCESSDENIED;
 use windows::Win32::Media::KernelStreaming::{KSCATEGORY_CAPTURE, KSCATEGORY_VIDEO, KSCATEGORY_VIDEO_CAMERA};
@@ -25,10 +25,7 @@ pub struct VirtualCamera {
 
 impl VirtualCamera {
     pub fn create(name: &str, width: u32, height: u32) -> Result<Self> {
-        ensure!(
-            width <= MAX_WIDTH && height <= MAX_HEIGHT,
-            "the virtual camera supports up to {MAX_WIDTH}x{MAX_HEIGHT}"
-        );
+        ensure!(frame_section::fits(width, height), "the virtual camera supports up to 1920x1080 (or 1080x1920)");
         // SAFETY (all blocks here): plain Media Foundation calls with valid arguments.
         // Keep a multithreaded apartment for this thread without initialising COM on
         // it, and never shut Media Foundation down: doing that while any of its objects
@@ -70,7 +67,8 @@ impl CameraSink for VirtualCamera {
             self.last_open_attempt = Some(Instant::now());
             self.section = FrameWriter::open().ok();
         }
-        if let Some(section) = &self.section {
+        // Any size: the camera fits what it gets into the size the video app chose.
+        if let (Some(section), true) = (&self.section, frame_section::fits(frame.width, frame.height)) {
             section.write(frame.width, frame.height, &frame.rgb);
         }
         Ok(())

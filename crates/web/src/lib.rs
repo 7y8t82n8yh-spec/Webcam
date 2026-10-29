@@ -1,4 +1,4 @@
-//! The phone page, compiled to WebAssembly.
+//! The phone page, and the PC's admin page (`admin`), compiled to WebAssembly.
 //!
 //! The camera is sent to the PC over WebRTC: a real video stream (H.264, which the
 //! iPhone encodes in hardware) with congestion control. If WebRTC can't connect -
@@ -6,6 +6,7 @@
 //! a canvas and sent over a WebSocket, or HTTPS POSTs if even that is refused (see
 //! `jpeg`).
 
+mod admin;
 mod camera;
 mod controls;
 mod fetch;
@@ -25,8 +26,15 @@ use wasm_bindgen::prelude::*;
 
 use crate::page::Page;
 
-#[wasm_bindgen(start)]
-pub fn main() {
+/// Run the admin page (`admin.html`).
+#[wasm_bindgen]
+pub fn admin_page() {
+    admin::start(web_sys::window().expect("window"));
+}
+
+/// Run the phone page (`index.html`).
+#[wasm_bindgen]
+pub fn phone_page() {
     let window = web_sys::window().expect("window");
     let page = Page::new(window);
     controls::attach_controls(&page);

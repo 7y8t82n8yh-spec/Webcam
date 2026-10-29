@@ -20,7 +20,8 @@ use crate::convert;
 const FPS: u32 = 30;
 const FRAME_DURATION: i64 = 10_000_000 / FPS as i64; // 100 ns units
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
-/// Offered sizes; the first (NV12 1280x720) is the default.
+/// Offered sizes, each also turned to portrait. The default is the first NV12 one in
+/// the orientation of the app's picture (see `create_stream_descriptor`).
 const SIZES: [(u32, u32); 3] = [(1280, 720), (1920, 1080), (640, 360)];
 
 fn shutdown_error() -> windows::core::Error {
@@ -319,11 +320,15 @@ impl IMFMediaStream2_Impl for Stream_Impl {
 
 // ---------------------------------------------------------------- source
 
-/// Every offered format: NV12 then RGB32, each in all `SIZES`.
-fn create_video_types() -> windows::core::Result<Vec<Option<IMFMediaType>>> {
+/// Every offered format: NV12 then RGB32, each in all `SIZES`, landscape and portrait
+/// (portrait first if `portrait`).
+fn create_video_types(portrait: bool) -> windows::core::Result<Vec<Option<IMFMediaType>>> {
+    let landscape = SIZES;
+    let turned = SIZES.map(|(w, h)| (h, w));
+    let sizes = if portrait { [turned, landscape] } else { [landscape, turned] }.concat();
     let mut types = Vec::new();
     for subtype in [MFVideoFormat_NV12, MFVideoFormat_RGB32] {
-        for (w, h) in SIZES {
+        for &(w, h) in &sizes {
             types.push(Some(create_video_type(&subtype, w, h)?));
         }
     }
@@ -331,7 +336,11 @@ fn create_video_types() -> windows::core::Result<Vec<Option<IMFMediaType>>> {
 }
 
 fn create_stream_descriptor() -> windows::core::Result<IMFStreamDescriptor> {
-    let types = create_video_types()?;
+    // Video apps take the default size, chosen when they open the camera: make it
+    // portrait while the app's picture is (the picture was turned a quarter).
+    let portrait = FrameReader::new().read().is_some_and(|(_, w, h)| h > w);
+    vlog!("stream descriptor: {}", if portrait { "portrait" } else { "landscape" });
+    let types = create_video_types(portrait)?;
     unsafe {
         let descriptor = MFCreateStreamDescriptor(0, &types)?;
         descriptor.GetMediaTypeHandler()?.SetCurrentMediaType(types[0].as_ref())?;

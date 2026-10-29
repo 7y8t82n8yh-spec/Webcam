@@ -43,6 +43,7 @@ impl TestApp {
         let settings = Settings {
             host: "127.0.0.1".parse().unwrap(),
             port: 0,
+            admin_port: 0,
             width: OUTPUT_WIDTH,
             height: OUTPUT_HEIGHT,
             fps: OUTPUT_FPS,

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone Webcam</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73;
+    --accent: #0071e3; --ok: #1a7f37; --line: #d2d2d7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --muted: #98989d; --accent: #2997ff;
+      --ok: #30d158; --line: #38383a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px; display: flex; flex-wrap: wrap; gap: 16px; }
+  h1 { width: 100%; margin: 0 0 4px; font-size: 22px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  #phone { flex: 0 1 320px; }
+  #camera-card { flex: 1 1 420px; min-width: 0; }
+  h2 { margin: 0 0 12px; font-size: 15px; }
+  #qr { display: block; width: 240px; height: 240px; margin: 0 auto 14px; background: #fff;
+    border-radius: 8px; padding: 8px; image-rendering: pixelated; }
+  select, button { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 12px; }
+  select { width: 100%; margin-bottom: 8px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  #preview { display: block; width: 100%; max-height: 480px; object-fit: contain; background: #000;
+    border-radius: 8px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  #status.ok { color: var(--ok); }
+  #copied { font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>iPhone Webcam</h1>
+
+  <section id="phone">
+    <h2>Scan with the iPhone camera</h2>
+    <img id="qr" alt="QR code of the phone page address">
+    <select id="urls" title="Address of the phone page"></select>
+    <div class="row"><button id="copy">Copy address</button><span id="copied"></span></div>
+    <p class="muted">The iPhone must be on the same Wi-Fi as this PC. The first time, Safari warns about
+      the certificate: tap Show Details › visit this website.</p>
+  </section>
+
+  <section id="camera-card">
+    <h2>Virtual camera</h2>
+    <img id="preview" alt="What video apps see">
+    <div class="row" id="status">○ Waiting for iPhone…</div>
+    <div class="row">
+      <button id="rotate-left" title="Turn a quarter anticlockwise">Rotate left</button>
+      <button id="rotate-right" title="Turn a quarter clockwise">Rotate right</button>
+      <span id="rotation">0°</span>
+    </div>
+    <div class="row muted" id="camera"></div>
+    <p class="muted">After a quarter turn the camera becomes portrait. Video apps pick up the new shape
+      when they next open the camera: turn the video off and on again.</p>
+  </section>
+</main>
+<script type="module">
+  import init, { admin_page } from "/pkg/web.js";
+  init({ module_or_path: "/pkg/web_bg.wasm" }).then(admin_page);
+</script>
+</body>
+</html>

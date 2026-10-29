@@ -75,8 +75,8 @@
   </div>
 
   <script type="module">
-    import init from "/pkg/web.js";
-    init({ module_or_path: "/pkg/web_bg.wasm" });
+    import init, { phone_page } from "/pkg/web.js";
+    init({ module_or_path: "/pkg/web_bg.wasm" }).then(phone_page);
   </script>
 </body>
 </html>

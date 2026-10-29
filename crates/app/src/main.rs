@@ -20,6 +20,9 @@ struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0")]
     host: IpAddr,
+    /// Port of the admin page, on 127.0.0.1 (only this PC can open it).
+    #[arg(long, default_value_t = 8444)]
+    admin_port: u16,
     /// Virtual camera width.
     #[arg(long, default_value_t = 1280)]
     width: u32,
@@ -47,9 +50,9 @@ struct Args {
     /// Where certificates and the pairing key are stored.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Console only, no window.
-    #[arg(long)]
-    no_gui: bool,
+    /// Don't open the admin page in the browser at startup.
+    #[arg(long, alias = "no-gui")]
+    no_browser: bool,
     #[arg(short, long)]
     verbose: bool,
     /// Set on the copy that install/uninstall start with administrator rights: its
@@ -100,7 +103,8 @@ fn print_banner(app: &App) {
         println!("\n{art}");
     }
     println!("Safari warns about the certificate the first time: tap 'Show Details' > 'visit this website'.");
-    println!("Close the window or press Ctrl+C to quit.\n");
+    println!("\nAdmin page (QR code, preview, rotation): {}", app.admin_url);
+    println!("Close this window or press Ctrl+C to quit.\n");
 }
 
 fn main() -> Result<()> {
@@ -123,6 +127,7 @@ fn main() -> Result<()> {
     let settings = Settings {
         host: args.host,
         port: args.port,
+        admin_port: args.admin_port,
         width: args.width,
         height: args.height,
         fps: args.fps,
@@ -135,8 +140,8 @@ fn main() -> Result<()> {
     };
     let mut app = App::start(settings)?;
     print_banner(&app);
-    if !args.no_gui {
-        return iphone_webcam::gui::run(app);
+    if !args.no_browser {
+        open_in_browser(&app.admin_url);
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -144,6 +149,19 @@ fn main() -> Result<()> {
     let _ = rx.recv();
     app.stop();
     Ok(())
+}
+
+fn open_in_browser(url: &str) {
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    if let Err(err) = command.arg(url).spawn() {
+        tracing::warn!("could not open the browser ({err}); open {url} yourself");
+    }
 }
 
 /// `install` / `uninstall`; returns the exit code.

@@ -19,6 +19,7 @@ use protocol::{ClientInfo, ClientMessage, OfferRequest, OfferResponse, ServerMes
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+use crate::admin::Admin;
 use crate::hub::FrameHub;
 use crate::plain_http::RedirectPlainHttp;
 use crate::web_assets;
@@ -207,7 +208,7 @@ async fn status(State(server): State<Arc<Server>>) -> Response {
         "decodeErrors": s.decode_errors,
         "transport": s.transport,
         "sourceSize": [s.source_size.0, s.source_size.1],
-        "outputSize": [server.hub.width, server.hub.height],
+        "outputSize": server.hub.output_size(),
     }))
     .into_response()
 }
@@ -326,24 +327,32 @@ async fn on_ws_message(server: &Server, tx: &mut WsSender, message: Option<Resul
     }
 }
 
-/// Serve the page and API over HTTPS on `listener` until `handle` shuts it down. Runs
-/// on its own thread, with its own async runtime.
+/// Serve the phone's page and API over HTTPS on `listener`, and the admin page over
+/// HTTP on `admin_listener`, until `handle` shuts them down. Runs on its own thread,
+/// with its own async runtime.
 pub fn run(
     server: Arc<Server>,
     listener: std::net::TcpListener,
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    admin: Arc<Admin>,
+    admin_listener: std::net::TcpListener,
     handle: axum_server::Handle<SocketAddr>,
 ) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let serving = async {
+    let phone = async {
         let tls = RustlsConfig::from_pem(cert_pem, key_pem).await?;
-        let service = server.router().into_make_service();
         let acceptor = RustlsAcceptor::new(tls).acceptor(RedirectPlainHttp);
-        axum_server::from_tcp(listener)?.acceptor(acceptor).handle(handle).serve(service).await?;
+        let service = server.router().into_make_service();
+        axum_server::from_tcp(listener)?.acceptor(acceptor).handle(handle.clone()).serve(service).await?;
         anyhow::Ok(())
     };
-    if let Err(err) = runtime.block_on(serving) {
+    let admin = async {
+        let service = admin.router().into_make_service();
+        axum_server::from_tcp(admin_listener)?.handle(handle.clone()).serve(service).await?;
+        anyhow::Ok(())
+    };
+    if let Err(err) = runtime.block_on(async { tokio::try_join!(phone, admin) }) {
         tracing::error!("server stopped: {err:#}");
     }
 }
