@@ -1,6 +1,7 @@
 //! `install` / `uninstall` on Linux: set up the v4l2loopback kernel module with a device
 //! named after the camera, now and at every boot, and open the HTTPS port in ufw or
-//! firewalld when one of them is active.
+//! firewalld when one of them is active. Both need root (`is_admin`, `run_as_admin`);
+//! `main` gets it first.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -24,15 +25,15 @@ fn output(program: &str, args: &[&str]) -> String {
 }
 
 /// Whether we run as root: `/proc/self` belongs to the process's effective user.
-fn is_root() -> bool {
+pub fn is_admin() -> bool {
     std::fs::metadata("/proc/self").is_ok_and(|proc_self| proc_self.uid() == 0)
 }
 
-/// Run this same command again through sudo and return its exit code.
-fn rerun_with_sudo() -> Result<i32> {
+/// Run this program again with `args` through sudo and return its exit code.
+pub fn run_as_admin(args: &[String]) -> Result<i32> {
     println!("Administrator rights are needed; running with sudo...");
     let exe = std::env::current_exe()?;
-    let status = Command::new("sudo").arg(exe).args(std::env::args_os().skip(1)).status().context("running sudo")?;
+    let status = Command::new("sudo").arg(exe).args(args).status().context("running sudo")?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -49,10 +50,7 @@ fn firewalld_running() -> bool {
 }
 
 /// `dll` is only used on Windows.
-pub fn install(port: u16, name: &str, _dll: Option<std::path::PathBuf>) -> Result<i32> {
-    if !is_root() {
-        return rerun_with_sudo();
-    }
+pub fn install(port: u16, name: &str, _dll: Option<std::path::PathBuf>) -> Result<()> {
     if !run("modinfo", &["v4l2loopback"]) {
         bail!(
             "the v4l2loopback kernel module isn't installed. Install it first, e.g.\n  \
@@ -93,14 +91,10 @@ pub fn install(port: u16, name: &str, _dll: Option<std::path::PathBuf>) -> Resul
         run("firewall-cmd", &["--reload"]);
         println!("firewalld: allowed TCP {port}.");
     }
-    println!("\nDone. Start iphone-webcam; the phone's video appears in \"{name}\" while it runs.");
-    Ok(0)
+    Ok(())
 }
 
-pub fn uninstall(port: u16, name: &str) -> Result<i32> {
-    if !is_root() {
-        return rerun_with_sudo();
-    }
+pub fn uninstall(port: u16, name: &str) -> Result<()> {
     let _ = std::fs::remove_file(MODPROBE_CONF);
     let _ = std::fs::remove_file(MODULES_LOAD);
     // Only unload the module if it's ours; other programs (OBS) may use it as well.
@@ -114,6 +108,6 @@ pub fn uninstall(port: u16, name: &str) -> Result<i32> {
         run("firewall-cmd", &["--permanent", &format!("--remove-port={port}/tcp")]);
         run("firewall-cmd", &["--reload"]);
     }
-    println!("Virtual camera setup and firewall rules removed.");
-    Ok(0)
+    println!("Removed the virtual camera setup and the firewall rules.");
+    Ok(())
 }

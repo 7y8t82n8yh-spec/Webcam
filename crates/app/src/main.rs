@@ -4,7 +4,8 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use iphone_webcam::app::{App, Settings};
 use iphone_webcam::hub::FitMode;
@@ -63,14 +64,45 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set up the virtual camera and open the firewall (asks for administrator rights).
+    /// Set up the virtual camera and open the firewall, replacing any earlier
+    /// installation (asks for administrator rights).
     Install {
         /// Windows: path to iPhoneWebcamVCam.dll (default: next to this program).
         #[arg(long)]
         dll: Option<PathBuf>,
     },
-    /// Remove the virtual camera and firewall rules.
+    /// Remove what the last install set up, whichever version it was.
     Uninstall,
+    /// Uninstall, then install this version, keeping the port and camera name of the
+    /// last install unless given here. For updating to a new version.
+    Reinstall {
+        /// Windows: path to iPhoneWebcamVCam.dll (default: next to this program).
+        #[arg(long)]
+        dll: Option<PathBuf>,
+    },
+}
+
+impl Cmd {
+    fn name(&self) -> &'static str {
+        match self {
+            Cmd::Install { .. } => "install",
+            Cmd::Uninstall => "uninstall",
+            Cmd::Reinstall { .. } => "reinstall",
+        }
+    }
+
+    fn dll(&self) -> Option<&PathBuf> {
+        match self {
+            Cmd::Install { dll } | Cmd::Reinstall { dll } => dll.as_ref(),
+            Cmd::Uninstall => None,
+        }
+    }
+}
+
+/// The settings given on the command line, as opposed to defaults.
+struct Given {
+    port: Option<u16>,
+    camera_name: Option<String>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -108,14 +140,20 @@ fn print_banner(app: &App) {
 }
 
 fn main() -> Result<()> {
-    let mut args = Args::parse();
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches)?;
+    let typed = |id| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let given = Given {
+        port: typed("port").then_some(args.port),
+        camera_name: typed("camera_name").then(|| args.camera_name.clone()),
+    };
     let filter = if args.verbose { "debug,str0m=info" } else { "info,str0m=warn" };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
     anyhow::ensure!(args.width % 2 == 0 && args.height % 2 == 0, "width and height must be even");
 
     if let Some(command) = args.command.take() {
-        let result = run_install_command(command, &args);
+        let result = run_install_command(command, &args, &given);
         if let (true, Err(err)) = (args.elevated, &result) {
             // The elevated console window closes on exit; keep the error readable.
             eprintln!("Error: {err:#}\n\nPress Enter to close this window.");
@@ -164,19 +202,66 @@ fn open_in_browser(url: &str) {
     }
 }
 
-/// `install` / `uninstall`; returns the exit code.
+/// `install`, `uninstall` or `reinstall`; returns the exit code.
 #[cfg(any(windows, target_os = "linux"))]
-fn run_install_command(command: Cmd, args: &Args) -> Result<i32> {
+fn run_install_command(command: Cmd, args: &Args, given: &Given) -> Result<i32> {
     use iphone_webcam::install;
-    match command {
-        Cmd::Install { dll } => install::install(args.port, &args.camera_name, dll),
-        Cmd::Uninstall => install::uninstall(args.port, &args.camera_name),
+    use iphone_webcam::install_record::{self, InstallRecord};
+
+    if !install::is_admin() {
+        return install::run_as_admin(&admin_args(&command, given)?);
     }
+    let installed = install_record::load();
+    if let Some(record) = &installed {
+        println!("Installed: version {} (port {}, camera \"{}\").", record.version, record.port, record.camera_name);
+        if record.version != env!("CARGO_PKG_VERSION") {
+            println!("This is version {}.", env!("CARGO_PKG_VERSION"));
+        }
+    }
+    // Remove what was installed: going by the record, else (installed by a version
+    // from before records, or by none) by the settings given. A plain install without
+    // a record just installs over whatever is there, as it always did.
+    if installed.is_some() || !matches!(command, Cmd::Install { .. }) {
+        let previous = installed.clone().unwrap_or_else(|| InstallRecord::new(args.port, &args.camera_name));
+        install::uninstall(previous.port, &previous.camera_name)?;
+        install_record::remove();
+    }
+
+    let (port, camera_name) = match (&command, &installed) {
+        (Cmd::Uninstall, _) => return Ok(0),
+        // Keep the last install's settings, unless new ones are given.
+        (Cmd::Reinstall { .. }, Some(record)) => {
+            (given.port.unwrap_or(record.port), given.camera_name.clone().unwrap_or_else(|| record.camera_name.clone()))
+        }
+        _ => (args.port, args.camera_name.clone()),
+    };
+    install::install(port, &camera_name, command.dll().cloned())?;
+    install_record::save(&InstallRecord::new(port, &camera_name))?;
+    println!("\nDone. Start iphone-webcam; the camera \"{camera_name}\" appears in video apps while it runs.");
+    Ok(0)
+}
+
+/// The arguments for running `command` again with administrator rights. That copy may
+/// start in another folder (System32 on Windows), so the DLL path is made absolute.
+#[cfg(any(windows, target_os = "linux"))]
+fn admin_args(command: &Cmd, given: &Given) -> Result<Vec<String>> {
+    let mut args = vec!["--elevated".to_string()];
+    if let Some(port) = given.port {
+        args.extend(["--port".into(), port.to_string()]);
+    }
+    if let Some(name) = &given.camera_name {
+        args.extend(["--camera-name".into(), name.clone()]);
+    }
+    args.push(command.name().into());
+    if let Some(dll) = command.dll() {
+        args.extend(["--dll".into(), std::path::absolute(dll)?.display().to_string()]);
+    }
+    Ok(args)
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn run_install_command(_: Cmd, _: &Args) -> Result<i32> {
-    anyhow::bail!("install/uninstall are for Windows 11 and Linux")
+fn run_install_command(_: Cmd, _: &Args, _: &Given) -> Result<i32> {
+    anyhow::bail!("install/uninstall/reinstall are for Windows 11 and Linux")
 }
 
 /// Ctrl+C (and console close) -> message on `tx`.

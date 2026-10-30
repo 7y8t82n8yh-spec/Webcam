@@ -20,6 +20,8 @@ pub mod install;
 #[cfg(target_os = "linux")]
 #[path = "install_linux.rs"]
 pub mod install;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod install_record;
 #[cfg(target_os = "linux")]
 pub mod v4l2;
 #[cfg(windows)]

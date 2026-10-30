@@ -40,7 +40,8 @@ compiled to WebAssembly.
    - opens TCP port 8443 in Windows Firewall, plus UDP for `iphone-webcam.exe` (WebRTC
      video).
 
-   `iphone-webcam.exe uninstall` removes all of it again.
+   `iphone-webcam.exe uninstall` removes all of it again. See *Updating* for new
+   versions.
 
 ## Setup on Linux (once)
 
@@ -59,6 +60,17 @@ compiled to WebAssembly.
 
    `iphone-webcam uninstall` removes all of it again. With Secure Boot on, the
    distribution's DKMS setup has to sign the module, or it won't load.
+
+## Updating
+
+Run `iphone-webcam reinstall` from the new version. Install saves a record of what it
+set up: the version, port and camera name, in the registry under
+`HKLM\SOFTWARE\iPhoneWebcam` (value `Installed`) on Windows, in
+`/etc/iphone-webcam/installed.json` on Linux. Reinstall reads it, removes exactly what
+the last install set up, whichever version that was, and installs this version with
+the same port and camera name (unless you pass new ones). `uninstall` goes by the record
+too. Installs from before the record existed are removed going by the settings given
+(the defaults otherwise).
 
 ## Daily use
 
@@ -105,7 +117,7 @@ iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
                   [--bitrate 6] [--quality 0.75] [--mode fit|fill]
                   [--camera-name NAME] [--host 0.0.0.0] [--data-dir DIR]
                   [--admin-port 8444] [--no-camera] [--no-browser] [-v]
-                  [install [--dll PATH] | uninstall]
+                  [install [--dll PATH] | reinstall [--dll PATH] | uninstall]
 ```
 
 * `--bitrate` caps the WebRTC video in Mbit/s. `--quality` is the JPEG quality used
@@ -114,8 +126,8 @@ iphone-webcam.exe [--port 8443] [--width 1280 --height 720] [--fps 30]
   `--mode fill` crops it instead.
 * `--no-browser` doesn't open the admin page at startup. If port 8444 is taken, the
   app picks another and prints the address.
-* If you change `--port`, run `iphone-webcam.exe --port <n> install` again so the
-  firewall rule matches.
+* If you change `--port`, run `iphone-webcam.exe --port <n> reinstall` so the firewall
+  rule matches; the old rule is removed.
 
 ## Limitations
 
@@ -199,6 +211,7 @@ programs as artifacts.
 | `crates/app/src/admin.rs` | Admin page server on 127.0.0.1: state, QR code, preview, rotation |
 | `crates/app/src/plain_http.rs` | Redirects `http://` requests on the phone's port to `https://` |
 | `crates/app/src/install.rs`, `install_linux.rs` | `install` / `uninstall`: camera setup and firewall rules |
+| `crates/app/src/install_record.rs` | The record of what was installed, for `uninstall` and `reinstall` |
 | `crates/vcam` | The camera DLL: a Media Foundation media source run by Windows' camera service |
 | `crates/vcam-probe` | Test tool that reads a camera through Media Foundation |
 | `crates/protocol` | Messages and the shared-memory layout used by more than one crate |

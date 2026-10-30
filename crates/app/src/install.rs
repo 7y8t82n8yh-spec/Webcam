@@ -1,6 +1,6 @@
-//! `iphone-webcam install` / `uninstall` on Windows: register the camera's media source
-//! (iPhoneWebcamVCam.dll) and open the firewall. Needs administrator rights; when
-//! started without, it asks for them (UAC) and runs itself again, elevated.
+//! `install` / `uninstall` on Windows: register the camera's media source
+//! (iPhoneWebcamVCam.dll) and open the firewall. Both need administrator rights
+//! (`is_admin`, `run_as_admin`); `main` gets them first.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,13 +14,8 @@ const UDP_RULE: &str = "iPhone Webcam (WebRTC video)";
 
 /// `camera_name` is only used on Linux: on Windows the app names the camera when it
 /// creates it.
-pub fn install(port: u16, _camera_name: &str, dll: Option<PathBuf>) -> Result<i32> {
+pub fn install(port: u16, _camera_name: &str, dll: Option<PathBuf>) -> Result<()> {
     let dll = find_dll(dll)?;
-    if !is_admin() {
-        // The elevated copy starts in System32, hence the absolute DLL path.
-        let args = format!("--elevated --port {port} install --dll \"{}\"", dll.display());
-        return run_elevated(&args);
-    }
     let build = windows_build()?;
     if build < 22000 {
         bail!("iPhone Webcam needs Windows 11 (this is build {build})");
@@ -62,21 +57,18 @@ pub fn install(port: u16, _camera_name: &str, dll: Option<PathBuf>) -> Result<i3
     netsh(&[&["add", "rule", &format!("name={UDP_RULE}"), "protocol=UDP", &program][..], &allow].concat())?;
     println!("Firewall: allowed TCP {port} and UDP for {}.", exe.display());
 
-    println!("\nDone. Start iPhone Webcam; the camera appears in video apps while it runs.");
-    Ok(0)
+    Ok(())
 }
 
-pub fn uninstall(_port: u16, _camera_name: &str) -> Result<i32> {
-    if !is_admin() {
-        return run_elevated("--elevated uninstall");
-    }
+/// The firewall rules go by name, so `port` doesn't matter here.
+pub fn uninstall(_port: u16, _camera_name: &str) -> Result<()> {
     let _ = LOCAL_MACHINE.remove_tree(class_key());
     // The DLL may stay behind while the camera service has it loaded.
     let _ = std::fs::remove_dir_all(install_dir());
     let _ = netsh(&["delete", "rule", &format!("name={TCP_RULE}")]);
     let _ = netsh(&["delete", "rule", &format!("name={UDP_RULE}")]);
-    println!("Virtual camera and firewall rules removed.");
-    Ok(0)
+    println!("Removed the virtual camera and the firewall rules.");
+    Ok(())
 }
 
 fn install_dir() -> PathBuf {
@@ -100,26 +92,50 @@ fn find_dll(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(std::path::absolute(path)?)
 }
 
-fn is_admin() -> bool {
+pub fn is_admin() -> bool {
     // SAFETY: no arguments, no pointers; it only reads this process's token.
     unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool()
 }
 
-/// Run this program again with administrator rights (the UAC prompt) and wait for it.
-fn run_elevated(args: &str) -> Result<i32> {
+/// Run this program again with `args` and administrator rights (the UAC prompt), and
+/// wait for it. It starts in System32, so paths in `args` must be absolute.
+pub fn run_as_admin(args: &[String]) -> Result<i32> {
     println!("Requesting administrator rights...");
     let exe = std::env::current_exe()?;
+    let command_line = args.iter().map(|arg| quote(arg)).collect::<Vec<_>>().join(" ");
     // PowerShell single-quoted strings escape ' as ''.
     let script = format!(
         "$p = Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
         exe.display().to_string().replace('\'', "''"),
-        args.replace('\'', "''"),
+        command_line.replace('\'', "''"),
     );
     let status = Command::new("powershell").args(["-NoProfile", "-Command", &script]).status()?;
     match status.code() {
         Some(code) => Ok(code),
         None => bail!("administrator rights were not granted"),
     }
+}
+
+/// `arg` quoted for a Windows command line: in double quotes, a `"` inside escaped as
+/// `\"`, and backslashes doubled where a quote follows them (the rules programs use to
+/// split their command line).
+fn quote(arg: &str) -> String {
+    let mut quoted = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escapes = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+        quoted.extend(std::iter::repeat_n('\\', escapes));
+        quoted.push(c);
+        backslashes = 0;
+    }
+    // Before the closing quote.
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 /// The Windows build number, as `winver` shows it.
@@ -138,4 +154,17 @@ fn netsh(args: &[&str]) -> Result<()> {
 
 fn run_quietly(program: &str, args: &[&str]) -> bool {
     Command::new(program).args(args).output().is_ok_and(|output| output.status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_quoting() {
+        assert_eq!(quote(r"C:\Program Files\x.dll"), r#""C:\Program Files\x.dll""#);
+        assert_eq!(quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote(r"dir\"), r#""dir\\""#);
+        assert_eq!(quote(r#"a\"b"#), r#""a\\\"b""#);
+    }
 }

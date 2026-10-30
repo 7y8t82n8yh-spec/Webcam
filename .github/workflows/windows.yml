@@ -115,10 +115,18 @@ jobs:
             -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "iPhoneWebcam" } |
             Format-List TimeCreated, Message
 
-      - name: Uninstall
+      - name: Reinstall and uninstall
         shell: pwsh
         run: |
+          # Reinstall takes the new port, as the install record shows.
+          target\release\iphone-webcam.exe reinstall --port 9443 --dll target\release\iPhoneWebcamVCam.dll
+          if ($LASTEXITCODE) { throw "reinstall failed" }
+          $record = (Get-ItemProperty HKLM:\SOFTWARE\iPhoneWebcam).Installed
+          Write-Host $record
+          if ($record -notmatch '"port": 9443') { throw "the install record doesn't show the new port" }
           target\release\iphone-webcam.exe uninstall
+          if ($LASTEXITCODE) { throw "uninstall failed" }
+          if ((Get-ItemProperty HKLM:\SOFTWARE\iPhoneWebcam -ErrorAction SilentlyContinue).Installed) { throw "install record left" }
           # The file itself may linger while the camera service still has it loaded.
           if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{8E3B5C1A-6F42-4D8B-9C77-2A1D5E0F4B93}") { throw "still registered" }
 

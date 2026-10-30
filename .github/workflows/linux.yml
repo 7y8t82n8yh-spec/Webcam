@@ -89,11 +89,16 @@ jobs:
         if: always()
         run: sudo dmesg | grep -i v4l2 | tail -20 || true
 
-      - name: Uninstall
+      - name: Reinstall and uninstall
         if: steps.v4l2.outputs.ready == 'true'
         run: |
+          # Reinstall keeps the camera name and takes the new port, as the record shows.
+          sudo target/release/iphone-webcam reinstall --port 9443
+          sudo cat /etc/iphone-webcam/installed.json
+          grep -q '"port": 9443' /etc/iphone-webcam/installed.json
           sudo target/release/iphone-webcam uninstall
           test ! -e /etc/modprobe.d/iphone-webcam.conf
+          test ! -e /etc/iphone-webcam
 
       - uses: actions/upload-artifact@v7
         with:
