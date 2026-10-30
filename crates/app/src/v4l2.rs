@@ -74,7 +74,8 @@ impl LoopbackCamera {
         }
         self.last_resize_attempt = Some(Instant::now());
         let path = &self.device.path;
-        if open_in_other_processes(path) {
+        if let Some(pid) = process_using(path) {
+            tracing::debug!("not resizing {} yet: process {pid} has it open", path.display());
             return;
         }
         self.file = None;
@@ -107,14 +108,17 @@ fn open_writer(path: &Path, width: u32, height: u32) -> Result<File> {
     Ok(file)
 }
 
-/// Whether another process has `path` open, going by the open files /proc lists (of
-/// the processes we may look at: ours, so the video apps the user runs).
-fn open_in_other_processes(path: &Path) -> bool {
+/// Another process that has `path` open (its id), going by the open files /proc lists
+/// for the processes we may look at: ours, so the video apps the user runs.
+fn process_using(path: &Path) -> Option<String> {
     let own_pid = std::process::id().to_string();
-    let Ok(processes) = std::fs::read_dir("/proc") else { return false };
+    let processes = std::fs::read_dir("/proc").ok()?;
     let others = processes.flatten().filter(|process| process.file_name() != own_pid.as_str());
-    let open_files = others.filter_map(|process| std::fs::read_dir(process.path().join("fd")).ok()).flatten();
-    open_files.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
+    let has_open = |process: &std::fs::DirEntry| {
+        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else { return false };
+        fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
+    };
+    others.filter(has_open).map(|process| process.file_name().to_string_lossy().into_owned()).next()
 }
 
 impl CameraSink for LoopbackCamera {
@@ -233,10 +237,10 @@ mod tests {
         let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
         // Whatever the child's stdin is: a terminal, a pipe or /dev/null.
         let target = std::fs::read_link(format!("/proc/{}/fd/0", child.id())).unwrap();
-        assert!(open_in_other_processes(&target));
+        assert!(process_using(&target).is_some());
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(!open_in_other_processes(Path::new("/nonexistent/device")));
+        assert_eq!(process_using(Path::new("/nonexistent/device")), None);
     }
 
     #[test]

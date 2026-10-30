@@ -38,6 +38,9 @@ impl TestApp {
     }
 
     fn start_with(camera: bool) -> TestApp {
+        // The app's log, shown for failing tests (and with --nocapture).
+        let log_filter = "info,iphone_webcam=debug,str0m=warn";
+        let _ = tracing_subscriber::fmt().with_env_filter(log_filter).with_test_writer().try_init();
         let run_id = rand::random::<u64>();
         let data_dir = std::env::temp_dir().join(format!("iphone-webcam-it-{run_id}"));
         let settings = Settings {
