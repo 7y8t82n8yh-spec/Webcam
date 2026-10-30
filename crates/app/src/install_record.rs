@@ -48,7 +48,8 @@ mod store {
     }
 
     pub fn remove() {
-        if let Ok(key) = LOCAL_MACHINE.open(KEY) {
+        // `open` alone gives read access only.
+        if let Ok(key) = LOCAL_MACHINE.options().write().open(KEY) {
             let _ = key.remove_value(VALUE);
         }
     }

@@ -87,7 +87,8 @@ jobs:
             Set-ItemProperty -Path "$store\NonPackaged" -Name Value -Value Allow
           }
           # Turn on the media source's diagnostic log.
-          New-Item -Path HKLM:\SOFTWARE\iPhoneWebcam -Force | Out-Null
+          # The key holds the install record already; New-Item -Force would wipe it.
+          if (!(Test-Path HKLM:\SOFTWARE\iPhoneWebcam)) { New-Item -Path HKLM:\SOFTWARE\iPhoneWebcam | Out-Null }
           Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLog -Value 1 -Type DWord
           New-Item -ItemType Directory -Force C:\vcamlogs | Out-Null
           icacls C:\vcamlogs /grant "*S-1-1-0:(OI)(CI)F" | Out-Null  # Everyone, so the service can write
@@ -118,6 +119,7 @@ jobs:
       - name: Reinstall and uninstall
         shell: pwsh
         run: |
+          if (-not (Get-ItemProperty HKLM:\SOFTWARE\iPhoneWebcam).Installed) { throw "install left no record" }
           # Reinstall takes the new port, as the install record shows.
           target\release\iphone-webcam.exe reinstall --port 9443 --dll target\release\iPhoneWebcamVCam.dll
           if ($LASTEXITCODE) { throw "reinstall failed" }

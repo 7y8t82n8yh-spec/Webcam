@@ -92,6 +92,7 @@ jobs:
       - name: Reinstall and uninstall
         if: steps.v4l2.outputs.ready == 'true'
         run: |
+          test -e /etc/iphone-webcam/installed.json
           # Reinstall keeps the camera name and takes the new port, as the record shows.
           sudo target/release/iphone-webcam reinstall --port 9443
           sudo cat /etc/iphone-webcam/installed.json
