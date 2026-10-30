@@ -113,7 +113,11 @@ fn open_writer(path: &Path, width: u32, height: u32) -> Result<File> {
 fn process_using(path: &Path) -> Option<String> {
     let own_pid = std::process::id().to_string();
     let processes = std::fs::read_dir("/proc").ok()?;
-    let others = processes.flatten().filter(|process| process.file_name() != own_pid.as_str());
+    // Processes are the numbered entries; /proc/self and /proc/thread-self are us.
+    let others = processes.flatten().filter(|process| {
+        let name = process.file_name();
+        name.to_str().is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()) && name != own_pid)
+    });
     let has_open = |process: &std::fs::DirEntry| {
         let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else { return false };
         fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
@@ -241,6 +245,10 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(process_using(Path::new("/nonexistent/device")), None);
+        // Not even we count: a file only we have open.
+        let ours = std::fs::File::open("/proc/version").unwrap();
+        assert_eq!(process_using(Path::new("/proc/version")), None);
+        drop(ours);
     }
 
     #[test]
