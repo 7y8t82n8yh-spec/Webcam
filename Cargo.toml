@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+# Raise for every release: install records it, so later versions know what to undo
+# (README, "Releasing").
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+# Inside an `unsafe fn`, unsafe operations still need their own `unsafe {}` block.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

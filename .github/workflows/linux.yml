@@ -1,0 +1,107 @@
+name: Linux
+
+on:
+  # Branches are covered by their pull request; running on both doubles the work.
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+      # Tests and the uploaded build share the release profile, so everything compiles
+      # once. Faster settings than a real release: no LTO, parallel code generation.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      # Must match the wasm-bindgen version in Cargo.lock.
+      WASM_BINDGEN_VERSION: "0.2.129"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Save the cache after failed runs too, otherwise every run after a
+          # failure compiles from scratch.
+          cache-on-failure: true
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # The project's prebuilt binary: seconds, instead of minutes compiling it.
+      - name: Install wasm-bindgen-cli
+        run: |
+          name="wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl"
+          url="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/${name}.tar.gz"
+          curl -sSfL "$url" | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+
+      - name: Build the phone page (Rust → WebAssembly)
+        run: cargo xtask web
+
+      # Everything, tests included, in one compile. Building only the programs would
+      # compile shared libraries a second time: the tests' dev-dependencies switch
+      # extra features on in them (tokio, rustls...), which changes the build.
+      - name: Build (release, all targets)
+        run: cargo build --release --workspace --all-targets
+
+      - name: Tests (headless Chrome with a fake camera)
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: cargo test --release --workspace --no-fail-fast
+
+      - name: Install v4l2loopback and the virtual camera
+        id: v4l2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg v4l2loopback-dkms "linux-headers-$(uname -r)"
+          # v4l2loopback needs the kernel's video driver (videodev), shipped in the
+          # modules-extra package. Runners boot different kernels, and Ubuntu doesn't
+          # always publish that package for brand-new ones.
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          if ! modinfo videodev > /dev/null 2>&1; then
+            echo "::warning::Kernel $(uname -r) has no video driver package; skipping the Linux camera test"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sudo target/release/iphone-webcam install
+          # The runner's user isn't in the video group.
+          sudo chmod 666 /dev/video*
+          ls -l /dev/video*
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Phone → WebRTC → v4l2loopback → ffmpeg
+        if: steps.v4l2.outputs.ready == 'true'
+        env:
+          CAMERA_E2E: "1"
+        # --workspace, like the build: selecting one package changes which features the
+        # shared libraries are built with, and recompiles them.
+        run: cargo test --release --workspace --test camera -- --nocapture
+
+      - name: Diagnostics
+        if: always()
+        run: sudo dmesg | grep -i v4l2 | tail -20 || true
+
+      - name: Reinstall and uninstall
+        if: steps.v4l2.outputs.ready == 'true'
+        run: |
+          test -e /etc/iphone-webcam/installed.json
+          # Reinstall keeps the camera name and takes the new port, as the record shows.
+          sudo target/release/iphone-webcam reinstall --port 9443
+          sudo cat /etc/iphone-webcam/installed.json
+          grep -q '"port": 9443' /etc/iphone-webcam/installed.json
+          sudo target/release/iphone-webcam uninstall
+          test ! -e /etc/modprobe.d/iphone-webcam.conf
+          test ! -e /etc/iphone-webcam
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: iPhoneWebcam-linux-x64
+          path: target/release/iphone-webcam

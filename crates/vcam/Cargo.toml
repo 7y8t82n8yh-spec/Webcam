@@ -1,0 +1,28 @@
+[package]
+name = "vcam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows 11 virtual camera media source for iPhone Webcam (loaded by the Frame Server service)"
+
+[lib]
+name = "iPhoneWebcamVCam"
+crate-type = ["cdylib"]
+
+[dependencies]
+protocol = { path = "../protocol" }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows-registry = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[lints]
+workspace = true

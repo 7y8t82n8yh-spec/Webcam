@@ -1,0 +1,141 @@
+name: Windows
+
+on:
+  # Branches are covered by their pull request; running on both doubles the work.
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows11:
+    runs-on: windows-2025
+    env:
+      CARGO_TERM_COLOR: always
+      # Tests and the uploaded build share the release profile, so everything compiles
+      # once. Faster settings than a real release: no LTO, parallel code generation.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      # Must match the wasm-bindgen version in Cargo.lock.
+      WASM_BINDGEN_VERSION: "0.2.129"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Save the cache after failed runs too, otherwise every run after a
+          # failure compiles from scratch.
+          cache-on-failure: true
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # The project's prebuilt binary: seconds, instead of minutes compiling it.
+      - name: Install wasm-bindgen-cli
+        shell: pwsh
+        run: |
+          $name = "wasm-bindgen-$env:WASM_BINDGEN_VERSION-x86_64-pc-windows-msvc"
+          $url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$env:WASM_BINDGEN_VERSION/$name.tar.gz"
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\wasm-bindgen.tar.gz" $url
+          tar -xzf "$env:RUNNER_TEMP\wasm-bindgen.tar.gz" -C $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\$name" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build the phone page (Rust → WebAssembly)
+        run: cargo xtask web
+
+      # Everything, tests included, in one compile. Building only the programs would
+      # compile shared libraries a second time: the tests' dev-dependencies switch
+      # extra features on in them (tokio, rustls...), which changes the build.
+      - name: Build (release, all targets)
+        run: cargo build --release --workspace --all-targets
+
+      # The runner has the Visual C++ runtime installed, users may not: make sure
+      # nothing depends on it (see .cargo/config.toml).
+      - name: No Visual C++ runtime dependency
+        shell: pwsh
+        run: |
+          foreach ($file in "iphone-webcam.exe", "iPhoneWebcamVCam.dll", "vcam-probe.exe") {
+            $bytes = [IO.File]::ReadAllBytes("target\release\$file")
+            $text = [Text.Encoding]::ASCII.GetString($bytes)
+            if ($text -match "(?i)vcruntime\d+\.dll|msvcp\d+\.dll") { throw "$file imports $($Matches[0])" }
+          }
+
+      - name: Tests (headless Chrome with a fake camera)
+        shell: pwsh
+        run: |
+          $env:CHROMIUM_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          cargo test --release --workspace --no-fail-fast
+
+      - name: Install the virtual camera
+        run: target\release\iphone-webcam.exe install --dll target\release\iPhoneWebcamVCam.dll
+
+      - name: Camera service and privacy settings
+        shell: pwsh
+        run: |
+          [Environment]::OSVersion | Format-List
+          # A fresh runner has never been asked for camera consent; allow it the way a user
+          # would under Settings > Privacy & security > Camera.
+          foreach ($root in "HKLM:", "HKCU:") {
+            $store = "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"
+            New-Item -Path "$store\NonPackaged" -Force | Out-Null
+            Set-ItemProperty -Path $store -Name Value -Value Allow
+            Set-ItemProperty -Path "$store\NonPackaged" -Name Value -Value Allow
+          }
+          # Turn on the media source's diagnostic log.
+          # The key holds the install record already; New-Item -Force would wipe it.
+          if (!(Test-Path HKLM:\SOFTWARE\iPhoneWebcam)) { New-Item -Path HKLM:\SOFTWARE\iPhoneWebcam | Out-Null }
+          Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLog -Value 1 -Type DWord
+          New-Item -ItemType Directory -Force C:\vcamlogs | Out-Null
+          icacls C:\vcamlogs /grant "*S-1-1-0:(OI)(CI)F" | Out-Null  # Everyone, so the service can write
+          Set-ItemProperty -Path HKLM:\SOFTWARE\iPhoneWebcam -Name VCamLogDir -Value C:\vcamlogs
+          Set-Service FrameServer -StartupType Manual -ErrorAction Continue
+          Start-Service FrameServer -ErrorAction Continue
+          Get-Service FrameServer, FrameServerMonitor -ErrorAction Continue | Format-Table Name, Status
+
+      - name: Phone → WebRTC → virtual camera → Media Foundation app
+        shell: pwsh
+        run: |
+          $env:VCAM_PROBE = "$PWD\target\release\vcam-probe.exe"
+          # --workspace, like the build: selecting one package changes which features the
+          # shared libraries are built with, and recompiles them.
+          cargo test --release --workspace --test camera -- --nocapture
+
+      - name: Virtual camera diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($log in Get-ChildItem C:\vcamlogs -Filter "*.log" -ErrorAction SilentlyContinue) {
+            Write-Host "===== $($log.FullName)"; Get-Content $log.FullName
+          }
+          Get-WinEvent -FilterHashtable @{LogName = "Application"; Id = 1000; StartTime = (Get-Date).AddMinutes(-30)} `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "iPhoneWebcam" } |
+            Format-List TimeCreated, Message
+
+      - name: Reinstall and uninstall
+        shell: pwsh
+        run: |
+          if (-not (Get-ItemProperty HKLM:\SOFTWARE\iPhoneWebcam).Installed) { throw "install left no record" }
+          # Reinstall takes the new port, as the install record shows.
+          target\release\iphone-webcam.exe reinstall --port 9443 --dll target\release\iPhoneWebcamVCam.dll
+          if ($LASTEXITCODE) { throw "reinstall failed" }
+          $record = (Get-ItemProperty HKLM:\SOFTWARE\iPhoneWebcam).Installed
+          Write-Host $record
+          if ($record -notmatch '"port": 9443') { throw "the install record doesn't show the new port" }
+          target\release\iphone-webcam.exe uninstall
+          if ($LASTEXITCODE) { throw "uninstall failed" }
+          if ((Get-ItemProperty HKLM:\SOFTWARE\iPhoneWebcam -ErrorAction SilentlyContinue).Installed) { throw "install record left" }
+          # The file itself may linger while the camera service still has it loaded.
+          if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{8E3B5C1A-6F42-4D8B-9C77-2A1D5E0F4B93}") { throw "still registered" }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: iPhoneWebcam-windows11
+          path: |
+            target/release/iphone-webcam.exe
+            target/release/iPhoneWebcamVCam.dll
+            target/release/vcam-probe.exe
