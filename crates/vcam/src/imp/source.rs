@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::core::{implement, Interface, GUID, HRESULT};
-use windows::Win32::Foundation::{ERROR_SET_NOT_FOUND, E_INVALIDARG, E_OUTOFMEMORY};
+use windows::Win32::Foundation::{ERROR_SET_NOT_FOUND, E_INVALIDARG, E_OUTOFMEMORY, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -21,7 +21,7 @@ const FPS: u32 = 30;
 const FRAME_DURATION: i64 = 10_000_000 / FPS as i64; // 100 ns units
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
 /// Offered sizes, each also turned to portrait. The default is the first NV12 one in
-/// the orientation of the app's picture (see `create_stream_descriptor`).
+/// the orientation of the app's picture (see `match_default_to_picture`).
 const SIZES: [(u32, u32); 3] = [(1280, 720), (1920, 1080), (640, 360)];
 
 fn shutdown_error() -> windows::core::Error {
@@ -110,6 +110,10 @@ impl Stream {
             return Err(shutdown_error());
         }
         Ok(inner)
+    }
+
+    fn is_running(&self) -> bool {
+        lock(&self.shared.inner).state == MF_STREAM_STATE_RUNNING
     }
 
     fn start(&self, start_time: &PROPVARIANT) -> windows::core::Result<()> {
@@ -320,12 +324,9 @@ impl IMFMediaStream2_Impl for Stream_Impl {
 
 // ---------------------------------------------------------------- source
 
-/// Every offered format: NV12 then RGB32, each in all `SIZES`, landscape and portrait
-/// (portrait first if `portrait`).
-fn create_video_types(portrait: bool) -> windows::core::Result<Vec<Option<IMFMediaType>>> {
-    let landscape = SIZES;
-    let turned = SIZES.map(|(w, h)| (h, w));
-    let sizes = if portrait { [turned, landscape] } else { [landscape, turned] }.concat();
+/// Every offered format: NV12 then RGB32, each in all `SIZES`, landscape then portrait.
+fn create_video_types() -> windows::core::Result<Vec<Option<IMFMediaType>>> {
+    let sizes = [SIZES, SIZES.map(|(w, h)| (h, w))].concat();
     let mut types = Vec::new();
     for subtype in [MFVideoFormat_NV12, MFVideoFormat_RGB32] {
         for &(w, h) in &sizes {
@@ -335,15 +336,24 @@ fn create_video_types(portrait: bool) -> windows::core::Result<Vec<Option<IMFMed
     Ok(types)
 }
 
-fn create_stream_descriptor() -> windows::core::Result<IMFStreamDescriptor> {
-    // Video apps take the default size, chosen when they open the camera: make it
-    // portrait while the app's picture is (the picture was turned a quarter).
+/// Video apps take the default size when they open the camera: make it portrait while
+/// the app's picture is (it was turned a quarter). The camera service keeps the source
+/// between video apps, so this is redone whenever one opens it.
+fn match_default_to_picture(descriptor: &IMFStreamDescriptor) -> windows::core::Result<()> {
     let portrait = FrameReader::new().read().is_some_and(|(_, w, h)| h > w);
-    vlog!("stream descriptor: {}", if portrait { "portrait" } else { "landscape" });
-    let types = create_video_types(portrait)?;
+    vlog!("default size: {}", if portrait { "portrait" } else { "landscape" });
+    let index = if portrait { SIZES.len() as u32 } else { 0 }; // see create_video_types
+    unsafe {
+        let handler = descriptor.GetMediaTypeHandler()?;
+        handler.SetCurrentMediaType(&handler.GetMediaTypeByIndex(index)?)
+    }
+}
+
+fn create_stream_descriptor() -> windows::core::Result<IMFStreamDescriptor> {
+    let types = create_video_types()?;
     unsafe {
         let descriptor = MFCreateStreamDescriptor(0, &types)?;
-        descriptor.GetMediaTypeHandler()?.SetCurrentMediaType(types[0].as_ref())?;
+        match_default_to_picture(&descriptor)?;
         // What the Frame Server needs to treat the stream as a colour camera.
         descriptor.SetGUID(&MF_DEVICESTREAM_STREAM_CATEGORY, &PINNAME_VIDEO_CAPTURE)?;
         descriptor.SetUINT32(&MF_DEVICESTREAM_STREAM_ID, 0)?;
@@ -447,7 +457,15 @@ impl IMFMediaSource_Impl for Source_Impl {
     }
 
     fn CreatePresentationDescriptor(&self) -> windows::core::Result<IMFPresentationDescriptor> {
-        unsafe { self.live()?.presentation.Clone() }
+        let inner = self.live()?;
+        // A video app is opening the camera; don't change the size of a running stream.
+        if !self.stream.is_running() {
+            let mut selected = windows::core::BOOL::default();
+            let mut descriptor = None;
+            unsafe { inner.presentation.GetStreamDescriptorByIndex(0, &mut selected, &mut descriptor)? };
+            match_default_to_picture(descriptor.as_ref().ok_or(E_POINTER)?)?;
+        }
+        unsafe { inner.presentation.Clone() }
     }
 
     fn Start(
