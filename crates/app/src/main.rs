@@ -16,7 +16,7 @@ struct Args {
     #[command(subcommand)]
     command: Option<Cmd>,
     /// HTTPS port the phone connects to.
-    #[arg(long, default_value_t = 8443)]
+    #[arg(long, default_value_t = 8443, global = true)]
     port: u16,
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0")]
@@ -43,7 +43,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = FitMode::Fit)]
     mode: FitMode,
     /// Name of the virtual camera.
-    #[arg(long, default_value = "iPhone Webcam")]
+    #[arg(long, default_value = "iPhone Webcam", global = true)]
     camera_name: String,
     /// Don't create a virtual camera (testing).
     #[arg(long)]
@@ -273,4 +273,22 @@ fn wait_for_ctrlc(tx: std::sync::mpsc::Sender<()>) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let _ = runtime.block_on(tokio::signal::ctrl_c());
     let _ = tx.send(());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--port` and `--camera-name` count as given before or after the command.
+    #[test]
+    fn settings_given_either_side_of_the_command() {
+        for line in [["iphone-webcam", "--port", "9443", "reinstall"], ["iphone-webcam", "reinstall", "--port", "9443"]]
+        {
+            let matches = Args::command().try_get_matches_from(line).unwrap();
+            assert_eq!(matches.value_source("port"), Some(ValueSource::CommandLine), "{line:?}");
+            assert_eq!(Args::from_arg_matches(&matches).unwrap().port, 9443);
+        }
+        let matches = Args::command().try_get_matches_from(["iphone-webcam", "reinstall"]).unwrap();
+        assert_eq!(matches.value_source("port"), Some(ValueSource::DefaultValue));
+    }
 }
