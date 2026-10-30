@@ -198,6 +198,18 @@ from the fake phone, and check that an ordinary client sees that colour: `vcam-p
 through Media Foundation, or ffmpeg from the v4l2loopback device. They upload the built
 programs as artifacts.
 
+### Releasing
+
+Raise `version` in the root `Cargo.toml` for every release. All the crates share it,
+so the program and the camera DLL always agree on it. It matters because `install`
+writes it into the install record, and that record is how a later version knows what
+it is undoing (see *Updating*). When a release changes what `install` sets up (moves the
+DLL, renames a firewall rule, adds a file), its `uninstall` and `reinstall` can only
+clean up after the earlier versions if it can tell their records apart. If two releases
+share a number, a record from either looks the same, and the old version's leftovers
+can't be recognised. The number also shows in `iphone-webcam --version` and in what
+`reinstall` prints, so users can tell what they're replacing.
+
 | Path | What it does |
 | --- | --- |
 | `crates/web` | The phone page in Rust/WebAssembly: camera, wake lock, WebRTC sender, JPEG fallbacks; and the admin page (`admin.rs`) |

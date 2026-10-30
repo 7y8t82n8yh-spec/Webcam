@@ -3,6 +3,8 @@ resolver = "2"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
+# Raise for every release: install records it, so later versions know what to undo
+# (README, "Releasing").
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
