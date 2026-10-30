@@ -122,7 +122,7 @@ jobs:
           # The file itself may linger while the camera service still has it loaded.
           if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{8E3B5C1A-6F42-4D8B-9C77-2A1D5E0F4B93}") { throw "still registered" }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: iPhoneWebcam-windows11
           path: |

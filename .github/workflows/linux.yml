@@ -95,7 +95,7 @@ jobs:
           sudo target/release/iphone-webcam uninstall
           test ! -e /etc/modprobe.d/iphone-webcam.conf
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: iPhoneWebcam-linux-x64
           path: target/release/iphone-webcam
