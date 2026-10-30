@@ -3,7 +3,7 @@ name: Windows
 on:
   # Branches are covered by their pull request; running on both doubles the work.
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
