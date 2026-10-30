@@ -5,7 +5,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -42,7 +42,8 @@ pub fn loopback_devices() -> Vec<LoopbackDevice> {
 }
 
 pub struct LoopbackCamera {
-    file: File,
+    /// None only if reopening it after a resize failed.
+    file: Option<File>,
     device: LoopbackDevice,
     width: u32,
     height: u32,
@@ -59,38 +60,61 @@ impl LoopbackCamera {
         }
         let index = devices.iter().position(|device| device.label == name).unwrap_or(0);
         let device = devices.swap_remove(index);
-
-        let file =
-            OpenOptions::new().write(true).open(&device.path).with_context(|| device.path.display().to_string())?;
-        let mut format = Format::yuyv(width, height);
-        set_format(&file, &mut format).with_context(|| format!("setting the format of {}", device.path.display()))?;
-        // The device may adjust the request; the frames we write must match what it settled on.
-        ensure!(
-            format.width == width && format.height == height && format.pixelformat == PIX_FMT_YUYV,
-            "{} refused {width}x{height} YUYV (in use by another program?)",
-            device.path.display()
-        );
+        let file = open_writer(&device.path, width, height)?;
         let yuyv = vec![0; (width * height * 2) as usize];
-        Ok(Self { file, device, width, height, yuyv, last_resize_attempt: None })
+        Ok(Self { file: Some(file), device, width, height, yuyv, last_resize_attempt: None })
     }
 
-    /// Switch the device to `width x height` (after a rotation). It only allows that
-    /// while no video app has it open, so this is retried once a second.
+    /// Switch the device to `width x height` (after a rotation). The driver keeps a
+    /// device's size while anyone has it open, us included, so this waits until no
+    /// video app has it open (checked once a second), then reopens it.
     fn try_resize(&mut self, width: u32, height: u32) {
         if self.last_resize_attempt.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
             return;
         }
         self.last_resize_attempt = Some(Instant::now());
-        let mut format = Format::yuyv(width, height);
-        // A device in use answers with the format it keeps.
-        let resized = set_format(&self.file, &mut format).is_ok()
-            && (format.width, format.height, format.pixelformat) == (width, height, PIX_FMT_YUYV);
-        if resized {
-            tracing::info!("{} is now {width}x{height}", self.device.path.display());
-            (self.width, self.height) = (width, height);
-            self.yuyv.resize((width * height * 2) as usize, 0);
+        let path = &self.device.path;
+        if open_in_other_processes(path) {
+            return;
+        }
+        self.file = None;
+        match open_writer(path, width, height) {
+            Ok(file) => {
+                tracing::info!("{} is now {width}x{height}", path.display());
+                self.file = Some(file);
+                (self.width, self.height) = (width, height);
+                self.yuyv.resize((width * height * 2) as usize, 0);
+            }
+            Err(err) => {
+                tracing::warn!("could not resize {}: {err:#}", path.display());
+                self.file = open_writer(path, self.width, self.height).ok();
+            }
         }
     }
+}
+
+/// Open the device at `path` for writing `width x height` YUYV frames.
+fn open_writer(path: &Path, width: u32, height: u32) -> Result<File> {
+    let file = OpenOptions::new().write(true).open(path).with_context(|| path.display().to_string())?;
+    let mut format = Format::yuyv(width, height);
+    set_format(&file, &mut format).with_context(|| format!("setting the format of {}", path.display()))?;
+    // The device may adjust the request; the frames we write must match what it settled on.
+    ensure!(
+        format.width == width && format.height == height && format.pixelformat == PIX_FMT_YUYV,
+        "{} refused {width}x{height} YUYV (in use by another program?)",
+        path.display()
+    );
+    Ok(file)
+}
+
+/// Whether another process has `path` open, going by the open files /proc lists (of
+/// the processes we may look at: ours, so the video apps the user runs).
+fn open_in_other_processes(path: &Path) -> bool {
+    let own_pid = std::process::id().to_string();
+    let Ok(processes) = std::fs::read_dir("/proc") else { return false };
+    let others = processes.flatten().filter(|process| process.file_name() != own_pid.as_str());
+    let open_files = others.filter_map(|process| std::fs::read_dir(process.path().join("fd")).ok()).flatten();
+    open_files.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
 }
 
 impl CameraSink for LoopbackCamera {
@@ -106,8 +130,10 @@ impl CameraSink for LoopbackCamera {
             letterboxed = hub::letterbox(frame, self.width, self.height);
             &letterboxed
         };
+        let path = &self.device.path;
+        let Some(file) = self.file.as_mut() else { bail!("{} could not be reopened", path.display()) };
         rgb_to_yuyv(&frame.rgb, &mut self.yuyv);
-        self.file.write_all(&self.yuyv).with_context(|| format!("writing to {}", self.device.path.display()))
+        file.write_all(&self.yuyv).with_context(|| format!("writing to {}", path.display()))
     }
 
     fn describe(&self) -> String {
@@ -200,6 +226,17 @@ mod tests {
     fn format_matches_the_kernel() {
         assert_eq!(std::mem::size_of::<Format>(), 208);
         assert_eq!(VIDIOC_S_FMT, 0xc0d0_5605);
+    }
+
+    #[test]
+    fn finds_files_other_processes_have_open() {
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        // Whatever the child's stdin is: a terminal, a pipe or /dev/null.
+        let target = std::fs::read_link(format!("/proc/{}/fd/0", child.id())).unwrap();
+        assert!(open_in_other_processes(&target));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!open_in_other_processes(Path::new("/nonexistent/device")));
     }
 
     #[test]
