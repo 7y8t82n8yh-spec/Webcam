@@ -21,6 +21,8 @@ pub struct VirtualCamera {
     name: String,
     section: Option<FrameWriter>,
     last_open_attempt: Option<Instant>,
+    /// Whether the last frame was portrait.
+    portrait: Option<bool>,
 }
 
 impl VirtualCamera {
@@ -55,7 +57,19 @@ impl VirtualCamera {
             }
         })?;
         unsafe { camera.Start(None) }.context("starting the virtual camera")?;
-        Ok(Self { camera, name: name.to_string(), section: None, last_open_attempt: None })
+        Ok(Self { camera, name: name.to_string(), section: None, last_open_attempt: None, portrait: None })
+    }
+
+    /// Restart the camera, so that Windows' camera service makes a new media source,
+    /// which offers sizes in the new orientation by default. (The service asks a source
+    /// for its formats only once.) Video apps using the camera lose it and reopen it.
+    fn restart(&self) -> Result<()> {
+        tracing::info!("restarting the virtual camera for the new orientation");
+        // SAFETY: plain calls on a valid camera object.
+        unsafe {
+            self.camera.Stop().context("stopping the virtual camera")?;
+            self.camera.Start(None).context("starting the virtual camera")
+        }
     }
 }
 
@@ -70,6 +84,11 @@ impl CameraSink for VirtualCamera {
         // Any size: the camera fits what it gets into the size the video app chose.
         if let (Some(section), true) = (&self.section, frame_section::fits(frame.width, frame.height)) {
             section.write(frame.width, frame.height, &frame.rgb);
+        }
+        // After the frame, which the new source looks at for its default size.
+        let portrait = frame.height > frame.width;
+        if self.portrait.replace(portrait).is_some_and(|before| before != portrait) {
+            self.restart()?;
         }
         Ok(())
     }

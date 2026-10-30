@@ -77,9 +77,14 @@ compiled to WebAssembly.
 
 **Rotating:** the admin page's **Rotate left/right** buttons turn the picture, for a
 phone held sideways or upside down. After a quarter turn the camera becomes portrait
-(720×1280 instead of 1280×720). A video app keeps the size it chose until it opens the
-camera again, so turn its video off and on after rotating; until then it gets the
-turned picture with black bars.
+(720×1280 instead of 1280×720). A video app keeps the size it chose while it has the
+camera open, so:
+
+* **Windows:** the app restarts the camera when it turns portrait or landscape, and
+  video apps get the new shape when they reconnect. If one doesn't reconnect by
+  itself, pick the camera in it again.
+* **Linux:** turn the video off and on in the video app. Until then it gets the turned
+  picture with black bars.
 
 The phone page has buttons for switching the front and back cameras, choosing a
 resolution, mirroring the preview, and **Dim**, which blacks out the screen to save

@@ -78,7 +78,16 @@ async fn check_camera(size: (u32, u32), camera: &str) {
 fn read_camera() -> Option<CameraReading> {
     const PROBE_FRAMES: &str = "60";
     let probe = std::env::var_os("VCAM_PROBE")?;
-    let output = Command::new(probe).args([CAMERA_NAME, PROBE_FRAMES]).output().expect("run vcam-probe");
+    const CAMERA_NOT_FOUND: i32 = 2;
+    // After a rotation the app restarts the camera, which takes Windows a moment.
+    let mut output = Command::new(&probe).args([CAMERA_NAME, PROBE_FRAMES]).output().expect("run vcam-probe");
+    for _ in 0..10 {
+        if output.status.code() != Some(CAMERA_NOT_FOUND) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        output = Command::new(&probe).args([CAMERA_NAME, PROBE_FRAMES]).output().expect("run vcam-probe");
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("probe stdout:\n{stdout}\nprobe stderr:\n{stderr}");
